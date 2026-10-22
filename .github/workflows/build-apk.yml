@@ -49,6 +49,55 @@ jobs:
           open(path, 'w', encoding='utf-8').write(s)
           EOF
 
+      - name: 使用固定签名（便于覆盖安装）
+        run: |
+          if [ -f ci/debug.keystore ]; then
+            mkdir -p ~/.android
+            cp ci/debug.keystore ~/.android/debug.keystore
+            echo "已使用固定签名 ci/debug.keystore"
+          else
+            echo "::warning::没有找到 ci/debug.keystore，本次使用临时签名，新版可能无法覆盖安装旧版"
+          fi
+
+      - name: 添加屏幕常亮功能（安卓原生代码）
+        run: |
+          python3 - <<'EOF'
+          import glob, re, sys
+          files = glob.glob('android/app/src/main/**/MainActivity.kt', recursive=True)
+          if not files:
+              print('::warning::没找到 MainActivity.kt，跳过屏幕常亮补丁')
+              sys.exit(0)
+          f = files[0]
+          src = open(f, encoding='utf-8').read()
+          pkg = re.search(r'^package\s+([\w.]+)', src, re.M).group(1)
+          code = '''package PKG
+
+          import android.view.WindowManager
+          import io.flutter.embedding.android.FlutterActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.MethodChannel
+
+          class MainActivity : FlutterActivity() {
+              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+                  super.configureFlutterEngine(flutterEngine)
+                  MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "app/keepawake")
+                      .setMethodCallHandler { call, result ->
+                          runOnUiThread {
+                              if (call.method == "enable") {
+                                  window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                              } else {
+                                  window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                              }
+                              result.success(null)
+                          }
+                      }
+              }
+          }
+          '''
+          open(f, 'w', encoding='utf-8').write(code.replace('PKG', pkg))
+          print('已写入', f)
+          EOF
+
       - name: 提高 compileSdk 到 37（permission_handler 需要）
         run: |
           f=$(ls android/app/build.gradle.kts android/app/build.gradle 2>/dev/null | head -n1)
