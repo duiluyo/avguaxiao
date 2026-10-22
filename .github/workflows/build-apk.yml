@@ -30,6 +30,23 @@ jobs:
             flutter create --platforms=android --project-name video_scraper .
           fi
 
+      - name: 添加安卓权限（联网 + 读写存储）
+        run: |
+          python3 - <<'EOF'
+          path = 'android/app/src/main/AndroidManifest.xml'
+          s = open(path, encoding='utf-8').read()
+          if 'MANAGE_EXTERNAL_STORAGE' not in s:
+              perms = (
+                  '<uses-permission android:name="android.permission.INTERNET"/>\n'
+                  '    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>\n'
+                  '    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>\n'
+                  '    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>\n'
+                  '    '
+              )
+              s = s.replace('<application', perms + '<application', 1)
+              open(path, 'w', encoding='utf-8').write(s)
+          EOF
+
       - name: 安装依赖
         run: flutter pub get
 
