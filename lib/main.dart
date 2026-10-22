@@ -16,7 +16,7 @@ import 'package:path/path.dart' as p;
 import 'package:permission_handler/permission_handler.dart';
 
 /// 每次修改代码都要同步修改这里和 pubspec.yaml 里的 version
-const appVersion = '1.2.1';
+const appVersion = '1.3.0';
 
 void main() => runApp(const ScraperApp());
 
@@ -74,6 +74,7 @@ class Cfg {
   bool downloadSub = false;
   String subUrl = 'https://www.subtitlecat.com';
   String themeMode = 'system';
+  bool keepAwake = true;
 
   Map<String, dynamic> toJson() => {
         'javbusUrl': javbusUrl,
@@ -89,6 +90,7 @@ class Cfg {
         'downloadSub': downloadSub,
         'subUrl': subUrl,
         'themeMode': themeMode,
+        'keepAwake': keepAwake,
       };
 
   void load(Map<String, dynamic> j) {
@@ -105,6 +107,7 @@ class Cfg {
     downloadSub = (j['downloadSub'] ?? downloadSub) as bool;
     subUrl = (j['subUrl'] ?? subUrl) as String;
     themeMode = (j['themeMode'] ?? themeMode) as String;
+    keepAwake = (j['keepAwake'] ?? keepAwake) as bool;
   }
 }
 
@@ -183,18 +186,65 @@ const _bannedPrefix = {
   'CD', 'PART', 'DISC', 'HD', 'SD', 'DDP', 'DTS', 'EAC', 'AC', 'MP',
 };
 
-/// "[xxx] ssis00123 1080p.mp4" -> "SSIS-123"
-String? extractCode(String filename) {
-  final base = p.basenameWithoutExtension(filename);
+final _domainRe = RegExp(
+    r'[A-Za-z0-9\-]+\.(?:com|net|org|cc|me|tv|xyz|top|vip|info|io|co|la|ru|app|club|site|fun)',
+    caseSensitive: false);
+
+/// 文件名后面跟着 -C / -U / -UC 之类的标记 → 中文字幕 / 无码
+List<String> _flagTags(String tail) {
+  final m = RegExp(r'^[-_ .]*(UC|C|U|UNCENSORED|LEAK|LEAKED)(?![A-Za-z])',
+          caseSensitive: false)
+      .firstMatch(tail);
+  if (m == null) return [];
+  final f = m.group(1)!.toUpperCase();
+  return [
+    if (f == 'C' || f == 'UC') '中文字幕',
+    if (f == 'U' || f == 'UC' || f == 'UNCENSORED' || f.startsWith('LEAK'))
+      '无码',
+  ];
+}
+
+/// 返回 (番号, 标记)。支持：
+///  - 普通番号 SSIS-123 / ssis00123 / HEYZO-1234
+///  - FC2：FC2-PPV-1234567
+///  - 日期型（一本道、加勒比等）：010123_001 / 010123-001
+(String, List<String>)? _parseCode(String filename) {
+  var base = p.basenameWithoutExtension(filename);
+  base = base.replaceAll(_domainRe, ' '); // 去掉 xxx.com@ 之类的网址前缀
+
+  final fc2 = RegExp(r'(?<![A-Za-z0-9])FC2[-_ ]?(?:PPV)?[-_ ]?(\d{5,8})(?!\d)',
+          caseSensitive: false)
+      .firstMatch(base);
+  if (fc2 != null) {
+    return ('FC2-PPV-${fc2.group(1)}', _flagTags(base.substring(fc2.end)));
+  }
+
+  final dated =
+      RegExp(r'(?<!\d)(\d{6})([-_])(\d{2,4})(?!\d)').firstMatch(base);
+  if (dated != null) {
+    return (
+      '${dated.group(1)}${dated.group(2)}${dated.group(3)}',
+      _flagTags(base.substring(dated.end)),
+    );
+  }
+
   final re = RegExp(r'(?<![A-Za-z0-9])([A-Za-z]{2,6})[-_ ]?(\d{2,5})(?!\d)');
   for (final m in re.allMatches(base)) {
     final letters = m.group(1)!.toUpperCase();
     if (_bannedPrefix.contains(letters)) continue;
     final n = int.parse(m.group(2)!);
-    return '$letters-${n.toString().padLeft(3, '0')}';
+    return (
+      '$letters-${n.toString().padLeft(3, '0')}',
+      _flagTags(base.substring(m.end)),
+    );
   }
   return null;
 }
+
+/// "[xxx] ssis00123 1080p.mp4" -> "SSIS-123"
+String? extractCode(String filename) => _parseCode(filename)?.$1;
+
+List<String> codeTags(String filename) => _parseCode(filename)?.$2 ?? [];
 
 // ═══════════════════════ 数据模型 ═══════════════════════
 
@@ -501,16 +551,22 @@ Future<File> moveFile(File f, String newPath) async {
 }
 
 /// 把视频和它的同名附属文件（字幕、旧 NFO、海报等）移进 destDir，
-/// 返回视频的新路径
-Future<String> organizeInto(File video, String destDir) async {
+/// 返回视频的新路径。moves / newDirs 用来记录操作，供「撤销」使用
+Future<String> organizeInto(File video, String destDir,
+    {List? moves, List? newDirs}) async {
   final srcDir = video.parent.path;
   if (p.equals(srcDir, destDir)) return video.path;
-  await Directory(destDir).create(recursive: true);
+  final dir = Directory(destDir);
+  if (!dir.existsSync()) {
+    await dir.create(recursive: true);
+    newDirs?.add(destDir);
+  }
 
   final stem = p.basenameWithoutExtension(video.path);
   final entries = await Directory(srcDir).list().toList();
 
   final moved = await moveFile(video, p.join(destDir, p.basename(video.path)));
+  moves?.add([video.path, moved.path]);
 
   for (final e in entries) {
     if (e is! File || p.equals(e.path, video.path)) continue;
@@ -523,7 +579,8 @@ Future<String> organizeInto(File video, String destDir) async {
     final target = p.join(destDir, name);
     if (File(target).existsSync()) continue;
     try {
-      await moveFile(e, target);
+      final mf = await moveFile(e, target);
+      moves?.add([e.path, mf.path]);
     } catch (_) {}
   }
   return moved.path;
@@ -623,6 +680,48 @@ Future<(Uint8List, String)?> fetchSubtitle(
   return (b, bestLang);
 }
 
+// ═══════════════════════ 整理记录（用于撤销）═══════════════════════
+
+const _journalPath = '/storage/emulated/0/刮削器/journal.json';
+
+Future<List<Map<String, dynamic>>> loadJournal() async {
+  try {
+    final f = File(_journalPath);
+    if (!f.existsSync()) return [];
+    final j = jsonDecode(await f.readAsString()) as List;
+    return j.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+  } catch (_) {
+    return [];
+  }
+}
+
+Future<void> saveJournal(List<Map<String, dynamic>> batches) async {
+  try {
+    final f = File(_journalPath);
+    await f.parent.create(recursive: true);
+    final keep =
+        batches.length > 10 ? batches.sublist(batches.length - 10) : batches;
+    await f.writeAsString(jsonEncode(keep));
+  } catch (_) {}
+}
+
+/// 失败的文件（可以手动输入番号重试）
+class _Fail {
+  final File file;
+  final String reason;
+  _Fail(this.file, this.reason);
+}
+
+// ═══════════════════════ 屏幕常亮（原生，由打包脚本注入） ═══════════════════════
+
+const _keepAwakeChannel = MethodChannel('app/keepawake');
+
+Future<void> keepAwake(bool on) async {
+  try {
+    await _keepAwakeChannel.invokeMethod(on ? 'enable' : 'disable');
+  } catch (_) {}
+}
+
 // ═══════════════════════ NFO ═══════════════════════
 
 String _x(String s) => s
@@ -631,7 +730,7 @@ String _x(String s) => s
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;');
 
-String buildNfo(Movie m) {
+String buildNfo(Movie m, [List<String> extraTags = const []]) {
   final year = m.date.length >= 4 ? m.date.substring(0, 4) : '';
   final b = StringBuffer();
   b.writeln('<?xml version="1.0" encoding="utf-8" standalone="yes"?>');
@@ -655,6 +754,9 @@ String buildNfo(Movie m) {
   for (final g in m.genres) {
     b.writeln('  <genre>${_x(g)}</genre>');
     b.writeln('  <tag>${_x(g)}</tag>');
+  }
+  for (final t in extraTags) {
+    b.writeln('  <tag>${_x(t)}</tag>');
   }
   for (final a in m.actors) {
     b.writeln('  <actor>');
@@ -690,6 +792,12 @@ class _HomePageState extends State<HomePage> {
   bool _cancel = false;
   int _done = 0;
   int _total = 0;
+  final _failed = <_Fail>[];
+  String _failReason = '';
+  Map<String, dynamic>? _batch;
+  int _undoCount = 0;
+  final _cache = <String, Movie>{};
+  final _coverCache = <String, Uint8List>{};
 
   @override
   void initState() {
@@ -699,6 +807,7 @@ class _HomePageState extends State<HomePage> {
     _proxyCtl.text = s.proxy;
     _subCtl.text = s.subUrl;
     _loadCfg();
+    _loadJournalInfo();
   }
 
   @override
@@ -773,8 +882,40 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  Future<void> _loadJournalInfo() async {
+    final all = await loadJournal();
+    if (mounted) setState(() => _undoCount = all.length);
+  }
+
+  Map<String, dynamic> _newBatch(String label) => {
+        'id': DateTime.now().toIso8601String(),
+        'label': label,
+        'moves': [],
+        'created': [],
+        'dirs': [],
+      };
+
+  /// 记录本次生成的文件（撤销时会删除）
+  void _rec(String path) {
+    final c = _batch?['created'];
+    if (c is List) c.add(path);
+  }
+
+  Future<void> _commitBatch() async {
+    final b = _batch;
+    if (b == null) return;
+    final has =
+        (b['moves'] as List).isNotEmpty || (b['created'] as List).isNotEmpty;
+    final all = await loadJournal();
+    all.removeWhere((e) => e['id'] == b['id']);
+    if (has) all.add(b);
+    await saveJournal(all);
+    if (mounted) setState(() => _undoCount = all.length);
+  }
+
   /// 返回 0=成功 1=跳过 2=失败
-  Future<int> _processOne(Net net, File file) async {
+  Future<int> _processOne(Net net, File file,
+      {String? forceNum, bool dry = false}) async {
     final name = p.basename(file.path);
     final stem = p.basenameWithoutExtension(file.path);
     var base = p.withoutExtension(file.path);
@@ -783,28 +924,56 @@ class _HomePageState extends State<HomePage> {
       _log('⏭ 已有 NFO，跳过：$name');
       return 1;
     }
-    final num = extractCode(name);
+    final num = forceNum ?? extractCode(name);
     if (num == null) {
+      _failReason = '未识别番号';
       _log('❓ 未识别番号：$name');
       return 2;
     }
     _log('🔎 $num   ($name)');
 
-    final tasks = <Future<Partial?>>[];
-    if (s.useJavbus) {
-      tasks.add(_safe('JavBus', () => scrapeJavbus(net, s.javbusUrl, num)));
+    final Movie m;
+    final cached = _cache[num];
+    if (cached != null) {
+      _log('   · 本次已查询过这个番号，直接复用资料');
+      m = cached;
+    } else {
+      final tasks = <Future<Partial?>>[];
+      if (s.useJavbus) {
+        tasks.add(_safe('JavBus', () => scrapeJavbus(net, s.javbusUrl, num)));
+      }
+      if (s.useJavdb) {
+        tasks.add(_safe('JavDB', () => scrapeJavdb(net, s.javdbUrl, num)));
+      }
+      final got = (await Future.wait(tasks)).whereType<Partial>().toList();
+      if (s.useDmm) got.add(Partial('DMM')..covers = dmmCovers(num));
+      if (!got.any((e) => e.hasMeta)) {
+        _failReason = '所有来源都没查到';
+        _log('   ✖ 所有来源都没查到资料');
+        return 2;
+      }
+      m = mergeAll(num, got);
+      _cache[num] = m;
     }
-    if (s.useJavdb) {
-      tasks.add(_safe('JavDB', () => scrapeJavdb(net, s.javdbUrl, num)));
-    }
-    final got = (await Future.wait(tasks)).whereType<Partial>().toList();
-    if (s.useDmm) got.add(Partial('DMM')..covers = dmmCovers(num));
+    final tags = codeTags(name);
 
-    if (!got.any((e) => e.hasMeta)) {
-      _log('   ✖ 所有来源都没查到资料');
-      return 2;
+    // 试运行：只预览，不改动任何文件
+    if (dry) {
+      final folder = folderNameFor(m, s.folderMode, stem);
+      final where = !s.organize
+          ? '不整理'
+          : (p.basename(file.parent.path) == folder
+              ? '已在正确的文件夹里'
+              : '将移动到 $folder/');
+      final will = [
+        'NFO',
+        if (s.downloadCover) '封面',
+        if (s.downloadSub) '字幕',
+      ].join('+');
+      _log('📋 ${m.title}\n   来源：${m.sources.join(' + ')}\n'
+          '   $where；将生成：$will');
+      return 0;
     }
-    final m = mergeAll(num, got);
 
     // 整理：新建文件夹，把视频和同名附属文件移进去
     var organized = '';
@@ -813,7 +982,9 @@ class _HomePageState extends State<HomePage> {
       final folder = folderNameFor(m, s.folderMode, stem);
       if (p.basename(destDir) != folder) destDir = p.join(destDir, folder);
       try {
-        final moved = await organizeInto(file, destDir);
+        final moved = await organizeInto(file, destDir,
+            moves: _batch?['moves'] as List?,
+            newDirs: _batch?['dirs'] as List?);
         base = p.withoutExtension(moved);
         organized = folder;
       } catch (e) {
@@ -823,16 +994,28 @@ class _HomePageState extends State<HomePage> {
 
     var coverOk = false;
     if (s.downloadCover && m.covers.isNotEmpty) {
-      final res = await fetchCover(net, m.covers, _log);
-      if (res != null) {
-        final bytes = res.$1;
+      var bytes = _coverCache[num];
+      if (bytes == null) {
+        final res = await fetchCover(net, m.covers, _log);
+        if (res != null) {
+          bytes = res.$1;
+          if (_coverCache.length >= 20) {
+            _coverCache.remove(_coverCache.keys.first);
+          }
+          _coverCache[num] = bytes;
+        }
+      }
+      if (bytes != null) {
         final poster = await compute(makePoster, bytes);
         await File('$base-poster.jpg').writeAsBytes(poster ?? bytes);
         await File('$base-fanart.jpg').writeAsBytes(bytes);
+        _rec('$base-poster.jpg');
+        _rec('$base-fanart.jpg');
         coverOk = true;
       }
     }
-    await File('$base.nfo').writeAsString(buildNfo(m));
+    await File('$base.nfo').writeAsString(buildNfo(m, tags));
+    _rec('$base.nfo');
 
     var subNote = '';
     if (s.downloadSub) {
@@ -843,6 +1026,7 @@ class _HomePageState extends State<HomePage> {
           final sub = await fetchSubtitle(net, s.subUrl, num, _log);
           if (sub != null) {
             await File('$base.${sub.$2}.srt').writeAsBytes(sub.$1);
+            _rec('$base.${sub.$2}.srt');
             subNote = '字幕：✓';
           } else {
             subNote = '字幕：✗';
@@ -859,6 +1043,7 @@ class _HomePageState extends State<HomePage> {
       '封面：${s.downloadCover ? (coverOk ? '✓' : '✗') : '未开启'}',
       if (organized.isNotEmpty) '📁 $organized/',
       if (subNote.isNotEmpty) subNote,
+      if (tags.isNotEmpty) '🏷 ${tags.join('/')}',
     ].join('   ');
     _log('✅ ${m.title}\n   $tail');
     return 0;
@@ -874,6 +1059,7 @@ class _HomePageState extends State<HomePage> {
     }
     final num = extractCode(name);
     if (num == null) {
+      _failReason = '未识别番号';
       _log('❓ 未识别番号：$name');
       return 2;
     }
@@ -881,6 +1067,7 @@ class _HomePageState extends State<HomePage> {
     try {
       final sub = await fetchSubtitle(net, s.subUrl, num, _log);
       if (sub == null) {
+        _failReason = '没有中文字幕';
         _log('   ✖ 没有找到中文字幕');
         return 2;
       }
@@ -889,12 +1076,13 @@ class _HomePageState extends State<HomePage> {
       _log('✅ 字幕已保存：${p.basename(out)}');
       return 0;
     } catch (e) {
-      _log('   ✖ 字幕失败：${errText(e)}');
+      _failReason = errText(e);
+      _log('   ✖ 字幕失败：$_failReason');
       return 2;
     }
   }
 
-  Future<void> _start({bool subsOnly = false}) async {
+  Future<void> _start({bool subsOnly = false, bool dry = false}) async {
     if (_running) return;
     if (!await _ensurePermission()) {
       _log('❌ 没有获得「所有文件访问权限」。请在系统设置里给本应用开启后重试。');
@@ -912,9 +1100,19 @@ class _HomePageState extends State<HomePage> {
       _done = 0;
       _total = 0;
       _logs.clear();
+      _failed.clear();
     });
+    _cache.clear();
+    _coverCache.clear();
+    _batch = (subsOnly || dry)
+        ? null
+        : _newBatch(
+            '${DateTime.now().toString().substring(0, 16)}  ${p.basename(dir)}');
+
     _log('影片刮削器 v$appVersion');
-    _log('📂 扫描：$dir${subsOnly ? '（只下载字幕）' : ''}');
+    _log('📂 扫描：$dir'
+        '${subsOnly ? '（只下载字幕）' : dry ? '（试运行，不会改动任何文件）' : ''}');
+    if (s.keepAwake) keepAwake(true);
 
     final files = <File>[];
     try {
@@ -940,24 +1138,200 @@ class _HomePageState extends State<HomePage> {
           break;
         }
         var code = 2;
+        _failReason = '';
         try {
           code = subsOnly
               ? await _subOne(net, file)
-              : await _processOne(net, file);
+              : await _processOne(net, file, dry: dry);
         } catch (e) {
-          _log('❌ 出错：${errText(e)}');
+          _failReason = errText(e);
+          _log('❌ 出错：$_failReason');
         }
         if (code == 0) ok++;
         if (code == 1) skip++;
-        if (code == 2) fail++;
+        if (code == 2) {
+          fail++;
+          if (!subsOnly && !dry) {
+            _failed.add(_Fail(file, _failReason.isEmpty ? '失败' : _failReason));
+          }
+        }
+        if (_batch != null && code == 0) await _commitBatch();
         if (mounted) setState(() => _done++);
         if (code != 1) await Future.delayed(const Duration(milliseconds: 1500));
       }
     } finally {
       net.close();
+      keepAwake(false);
     }
-    _log('🎉 完成：成功 $ok，跳过 $skip，失败/未识别 $fail');
+    await _commitBatch();
+    _batch = null;
+    _log('${dry ? '📋 试运行结束' : '🎉 完成'}：'
+        '成功 $ok，跳过 $skip，失败/未识别 $fail'
+        '${_failed.isNotEmpty ? '（可点下方按钮手动输入番号重试）' : ''}');
     if (mounted) setState(() => _running = false);
+  }
+
+  /// 撤销上一次整理：文件移回原位，删除那次生成的 NFO/封面/字幕
+  Future<void> _undoLast() async {
+    if (_running) return;
+    final all = await loadJournal();
+    if (all.isEmpty) {
+      _log('没有可撤销的整理记录');
+      if (mounted) setState(() => _undoCount = 0);
+      return;
+    }
+    final b = all.last;
+    final moves = (b['moves'] as List)
+        .map((e) => (e as List).cast<String>())
+        .toList();
+    final created = (b['created'] as List).cast<String>();
+    final dirs = (b['dirs'] as List).cast<String>();
+    if (!mounted) return;
+    final yes = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('撤销上次整理？'),
+        content: Text('${b['label']}\n\n'
+            '将把 ${moves.length} 个文件移回原来的位置，'
+            '并删除这次生成的 ${created.length} 个 NFO / 封面 / 字幕文件。'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('取消')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('撤销')),
+        ],
+      ),
+    );
+    if (yes != true) return;
+
+    setState(() => _running = true);
+    _log('↩ 开始撤销：${b['label']}');
+    for (final c in created) {
+      try {
+        final f = File(c);
+        if (f.existsSync()) await f.delete();
+      } catch (_) {}
+    }
+    var back = 0, miss = 0;
+    for (final mv in moves.reversed) {
+      final from = mv[0], to = mv[1];
+      try {
+        if (!File(to).existsSync() || File(from).existsSync()) {
+          miss++;
+          continue;
+        }
+        await Directory(p.dirname(from)).create(recursive: true);
+        await moveFile(File(to), from);
+        back++;
+      } catch (e) {
+        miss++;
+        _log('   ⚠️ ${p.basename(to)} 无法移回：${errText(e)}');
+      }
+    }
+    for (final d in dirs.reversed) {
+      try {
+        final dir = Directory(d);
+        if (dir.existsSync() && dir.listSync().isEmpty) await dir.delete();
+      } catch (_) {}
+    }
+    all.removeLast();
+    await saveJournal(all);
+    _log('↩ 已撤销：移回 $back 个文件'
+        '${miss > 0 ? '，$miss 个没法移回（已不在原处，或原位置已有同名文件）' : ''}');
+    if (mounted) {
+      setState(() {
+        _undoCount = all.length;
+        _running = false;
+      });
+    }
+  }
+
+  /// 对失败的单个文件，手动指定番号后重试
+  Future<void> _retryOne(_Fail f, String input) async {
+    if (_running) return;
+    final num = extractCode(input) ?? input.trim().toUpperCase();
+    if (num.isEmpty) return;
+    _syncCfg();
+    setState(() {
+      _running = true;
+      _cancel = false;
+    });
+    _batch = _newBatch('手动处理 ${p.basename(f.file.path)}');
+    final net = Net(s.proxy);
+    var code = 2;
+    try {
+      code = await _processOne(net, f.file, forceNum: num);
+    } catch (e) {
+      _log('❌ 出错：${errText(e)}');
+    } finally {
+      net.close();
+    }
+    await _commitBatch();
+    _batch = null;
+    if (mounted) {
+      setState(() {
+        if (code == 0) _failed.remove(f);
+        _running = false;
+      });
+    }
+  }
+
+  Future<String?> _askNum(BuildContext ctx, _Fail f) {
+    final c = TextEditingController(
+        text: extractCode(p.basename(f.file.path)) ?? '');
+    return showDialog<String>(
+      context: ctx,
+      builder: (dctx) => AlertDialog(
+        title: const Text('输入番号'),
+        content: TextField(
+          controller: c,
+          autofocus: true,
+          textCapitalization: TextCapitalization.characters,
+          decoration: const InputDecoration(
+            hintText: '例如 MVSD-696',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(dctx),
+              child: const Text('取消')),
+          FilledButton(
+              onPressed: () => Navigator.pop(dctx, c.text),
+              child: const Text('开始刮削')),
+        ],
+      ),
+    );
+  }
+
+  void _openFailed() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => SafeArea(
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            const ListTile(title: Text('点一下文件，手动输入番号后重试')),
+            for (final f in _failed)
+              ListTile(
+                title: Text(p.basename(f.file.path),
+                    maxLines: 2, overflow: TextOverflow.ellipsis),
+                subtitle: Text(f.reason),
+                trailing: const Icon(Icons.edit),
+                onTap: () async {
+                  final text = await _askNum(ctx, f);
+                  if (text == null || text.trim().isEmpty) return;
+                  if (ctx.mounted) Navigator.pop(ctx);
+                  _retryOne(f, text);
+                },
+              ),
+          ],
+        ),
+      ),
+    );
   }
 
   void _openSettings() {
@@ -1093,6 +1467,13 @@ class _HomePageState extends State<HomePage> {
                   value: s.downloadCover,
                   onChanged: (v) => setM(() => s.downloadCover = v),
                 ),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('处理时保持屏幕常亮'),
+                  subtitle: const Text('批量处理时防止息屏后被系统中断'),
+                  value: s.keepAwake,
+                  onChanged: (v) => setM(() => s.keepAwake = v),
+                ),
                 const SizedBox(height: 8),
                 const Text('字幕（实验性）',
                     style: TextStyle(fontWeight: FontWeight.bold)),
@@ -1127,6 +1508,11 @@ class _HomePageState extends State<HomePage> {
       appBar: AppBar(
         title: const Text('影片刮削器 v$appVersion'),
         actions: [
+          IconButton(
+            tooltip: '撤销上次整理',
+            icon: const Icon(Icons.undo),
+            onPressed: (_running || _undoCount == 0) ? null : _undoLast,
+          ),
           IconButton(
             tooltip: '复制日志',
             icon: const Icon(Icons.copy),
@@ -1167,14 +1553,37 @@ class _HomePageState extends State<HomePage> {
               ],
             ),
             const SizedBox(height: 8),
-            SizedBox(
-              width: double.infinity,
-              child: FilledButton.tonalIcon(
-                onPressed: _running ? null : () => _start(subsOnly: true),
-                icon: const Icon(Icons.subtitles),
-                label: const Text('只下载字幕'),
-              ),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: _running ? null : () => _start(dry: true),
+                    icon: const Icon(Icons.visibility),
+                    label: const Text('试运行预览'),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: FilledButton.tonalIcon(
+                    onPressed: _running ? null : () => _start(subsOnly: true),
+                    icon: const Icon(Icons.subtitles),
+                    label: const Text('只下载字幕'),
+                  ),
+                ),
+              ],
             ),
+            if (_failed.isNotEmpty && !_running)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton.icon(
+                    onPressed: _openFailed,
+                    icon: const Icon(Icons.edit_note),
+                    label: Text('手动处理失败的 ${_failed.length} 个'),
+                  ),
+                ),
+              ),
             if (_running || _total > 0) ...[
               const SizedBox(height: 12),
               LinearProgressIndicator(
