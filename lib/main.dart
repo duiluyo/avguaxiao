@@ -17,15 +17,38 @@ import 'package:permission_handler/permission_handler.dart';
 
 void main() => runApp(const ScraperApp());
 
+final themeNotifier = ValueNotifier<ThemeMode>(ThemeMode.system);
+
+ThemeMode themeFromString(String s) => s == 'light'
+    ? ThemeMode.light
+    : s == 'dark'
+        ? ThemeMode.dark
+        : ThemeMode.system;
+
+String themeToString(ThemeMode m) => m == ThemeMode.light
+    ? 'light'
+    : m == ThemeMode.dark
+        ? 'dark'
+        : 'system';
+
 class ScraperApp extends StatelessWidget {
   const ScraperApp({super.key});
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: '刮削器',
-      theme: ThemeData(colorSchemeSeed: Colors.indigo, useMaterial3: true),
-      home: const HomePage(),
+    return ValueListenableBuilder<ThemeMode>(
+      valueListenable: themeNotifier,
+      builder: (context, mode, _) => MaterialApp(
+        title: '刮削器',
+        themeMode: mode,
+        theme: ThemeData(colorSchemeSeed: Colors.indigo, useMaterial3: true),
+        darkTheme: ThemeData(
+          colorSchemeSeed: Colors.indigo,
+          brightness: Brightness.dark,
+          useMaterial3: true,
+        ),
+        home: const HomePage(),
+      ),
     );
   }
 }
@@ -43,6 +66,11 @@ class Cfg {
   bool useDmm = true;
   bool skipExisting = true;
   bool downloadCover = true;
+  bool organize = true;
+  String folderMode = 'num';
+  bool downloadSub = false;
+  String subUrl = 'https://www.subtitlecat.com';
+  String themeMode = 'system';
 
   Map<String, dynamic> toJson() => {
         'javbusUrl': javbusUrl,
@@ -53,6 +81,11 @@ class Cfg {
         'useDmm': useDmm,
         'skipExisting': skipExisting,
         'downloadCover': downloadCover,
+        'organize': organize,
+        'folderMode': folderMode,
+        'downloadSub': downloadSub,
+        'subUrl': subUrl,
+        'themeMode': themeMode,
       };
 
   void load(Map<String, dynamic> j) {
@@ -64,6 +97,11 @@ class Cfg {
     useDmm = (j['useDmm'] ?? useDmm) as bool;
     skipExisting = (j['skipExisting'] ?? skipExisting) as bool;
     downloadCover = (j['downloadCover'] ?? downloadCover) as bool;
+    organize = (j['organize'] ?? organize) as bool;
+    folderMode = (j['folderMode'] ?? folderMode) as String;
+    downloadSub = (j['downloadSub'] ?? downloadSub) as bool;
+    subUrl = (j['subUrl'] ?? subUrl) as String;
+    themeMode = (j['themeMode'] ?? themeMode) as String;
   }
 }
 
@@ -409,6 +447,179 @@ Uint8List? makePoster(Uint8List bytes) {
   return null;
 }
 
+// ═══════════════════════ 整理文件夹 ═══════════════════════
+
+const _sidecarExts = {
+  '.srt', '.ass', '.ssa', '.vtt', '.sub', '.idx',
+  '.nfo', '.jpg', '.jpeg', '.png',
+};
+
+/// 去掉文件名里不能用的字符，并限制长度
+String safeName(String s, {int max = 80}) {
+  var t = s
+      .replaceAll(RegExp(r'[\\/:*?"<>|\r\n\t]'), ' ')
+      .replaceAll(RegExp(r'\s+'), ' ')
+      .trim();
+  if (t.length > max) t = t.substring(0, max).trim();
+  t = t.replaceAll(RegExp(r'[. ]+$'), '');
+  return t;
+}
+
+/// mode: num=番号  numTitle=番号+标题  orig=原文件名
+String folderNameFor(Movie m, String mode, String origStem) {
+  String n;
+  switch (mode) {
+    case 'numTitle':
+      n = '${m.num} ${m.title}';
+      break;
+    case 'orig':
+      n = origStem;
+      break;
+    default:
+      n = m.num;
+  }
+  n = safeName(n);
+  return n.isEmpty ? m.num : n;
+}
+
+Future<File> moveFile(File f, String newPath) async {
+  if (p.equals(f.path, newPath)) return f;
+  if (File(newPath).existsSync()) {
+    throw '目标已存在同名文件：${p.basename(newPath)}';
+  }
+  try {
+    return await f.rename(newPath);
+  } catch (_) {
+    // 跨存储卡时 rename 会失败，改为复制后删除
+    final c = await f.copy(newPath);
+    await f.delete();
+    return c;
+  }
+}
+
+/// 把视频和它的同名附属文件（字幕、旧 NFO、海报等）移进 destDir，
+/// 返回视频的新路径
+Future<String> organizeInto(File video, String destDir) async {
+  final srcDir = video.parent.path;
+  if (p.equals(srcDir, destDir)) return video.path;
+  await Directory(destDir).create(recursive: true);
+
+  final stem = p.basenameWithoutExtension(video.path);
+  final entries = await Directory(srcDir).list().toList();
+
+  final moved = await moveFile(video, p.join(destDir, p.basename(video.path)));
+
+  for (final e in entries) {
+    if (e is! File || p.equals(e.path, video.path)) continue;
+    final name = p.basename(e.path);
+    final isSide = name.startsWith('$stem.') ||
+        name == '$stem-poster.jpg' ||
+        name == '$stem-fanart.jpg';
+    if (!isSide) continue;
+    if (!_sidecarExts.contains(p.extension(name).toLowerCase())) continue;
+    final target = p.join(destDir, name);
+    if (File(target).existsSync()) continue;
+    try {
+      await moveFile(e, target);
+    } catch (_) {}
+  }
+  return moved.path;
+}
+
+// ═══════════════════════ 字幕 ═══════════════════════
+
+const _subExts = {'.srt', '.ass', '.ssa', '.vtt', '.sub'};
+
+/// 视频旁边是否已经有字幕文件
+bool hasSubtitle(String base) {
+  final stem = p.basename(base);
+  try {
+    return Directory(p.dirname(base)).listSync().whereType<File>().any((f) {
+      final n = p.basename(f.path);
+      return n.startsWith('$stem.') &&
+          _subExts.contains(p.extension(n).toLowerCase());
+    });
+  } catch (_) {
+    return false;
+  }
+}
+
+/// 在字幕站按番号搜索，下载中文字幕（简体优先）。
+/// 成功返回 (字幕内容, 语言代码如 zh-CN)，没找到返回 null
+Future<(Uint8List, String)?> fetchSubtitle(
+    Net net, String baseUrl, String num, void Function(String) log) async {
+  final base = trimSlash(baseUrl);
+  final sr = await net
+      .get('$base/index.php?search=${Uri.encodeQueryComponent(num)}');
+  if (sr.statusCode != 200) throw '字幕站搜索 HTTP ${sr.statusCode}';
+  final sbody = decodeBody(sr);
+  if (looksBlocked(sbody)) throw '字幕站被拦截（Cloudflare）';
+  final sdoc = html_parser.parse(sbody);
+
+  final key = num.toUpperCase();
+  final pages = <String>[];
+  for (final a in sdoc.querySelectorAll('a')) {
+    final href = a.attributes['href'] ?? '';
+    if (!href.contains('subs/')) continue;
+    final hay = '${a.text} $href'.toUpperCase().replaceAll('_', '-');
+    if (!hay.contains(key)) continue;
+    final full = Uri.parse('$base/').resolve(href).toString();
+    if (!pages.contains(full)) pages.add(full);
+    if (pages.length >= 3) break;
+  }
+  if (pages.isEmpty) {
+    log('   · 字幕站没有这个番号');
+    return null;
+  }
+
+  final seen = <String>{};
+  final langRe = RegExp(r'-([a-zA-Z]{2,3}(?:-[A-Za-z]{2,4})?)\.srt$',
+      caseSensitive: false);
+  String? bestUrl;
+  var bestLang = '';
+  var bestScore = 0;
+
+  for (final page in pages) {
+    final dr = await net.get(page);
+    if (dr.statusCode != 200) continue;
+    final doc = html_parser.parse(decodeBody(dr));
+    for (final a in doc.querySelectorAll('a')) {
+      final href = a.attributes['href'] ?? '';
+      if (!href.toLowerCase().endsWith('.srt')) continue;
+      final lang = langRe.firstMatch(href)?.group(1) ?? '';
+      seen.add(lang.isEmpty ? '?' : lang);
+      final l = lang.toLowerCase();
+      var score = 0;
+      if (l == 'zh-cn' || l == 'zh-hans') {
+        score = 3;
+      } else if (l == 'zh-tw' || l == 'zh-hant') {
+        score = 2;
+      } else if (l == 'zh') {
+        score = 1;
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        bestUrl = Uri.parse(page).resolve(href).toString();
+        bestLang = lang;
+      }
+    }
+    if (bestScore == 3) break;
+  }
+
+  if (bestUrl == null) {
+    log('   · 字幕站没有中文字幕（只有：${seen.isEmpty ? '无' : seen.join(', ')}）');
+    return null;
+  }
+  final r = await net.get(bestUrl);
+  final b = r.bodyBytes;
+  final text = utf8.decode(b, allowMalformed: true);
+  if (r.statusCode != 200 || b.length < 200 || !text.contains('-->')) {
+    log('   · 字幕下载失败：HTTP ${r.statusCode}（${b.length}字节）');
+    return null;
+  }
+  return (b, bestLang);
+}
+
 // ═══════════════════════ NFO ═══════════════════════
 
 String _x(String s) => s
@@ -469,6 +680,7 @@ class _HomePageState extends State<HomePage> {
   final _javbusCtl = TextEditingController();
   final _javdbCtl = TextEditingController();
   final _proxyCtl = TextEditingController();
+  final _subCtl = TextEditingController();
   final _logs = <String>[];
   final _scroll = ScrollController();
   bool _running = false;
@@ -482,6 +694,7 @@ class _HomePageState extends State<HomePage> {
     _javbusCtl.text = s.javbusUrl;
     _javdbCtl.text = s.javdbUrl;
     _proxyCtl.text = s.proxy;
+    _subCtl.text = s.subUrl;
     _loadCfg();
   }
 
@@ -490,6 +703,7 @@ class _HomePageState extends State<HomePage> {
     _javbusCtl.dispose();
     _javdbCtl.dispose();
     _proxyCtl.dispose();
+    _subCtl.dispose();
     _scroll.dispose();
     super.dispose();
   }
@@ -502,9 +716,11 @@ class _HomePageState extends State<HomePage> {
       if (!mounted) return;
       setState(() {
         s.load(j);
+        themeNotifier.value = themeFromString(s.themeMode);
         _javbusCtl.text = s.javbusUrl;
         _javdbCtl.text = s.javdbUrl;
         _proxyCtl.text = s.proxy;
+        _subCtl.text = s.subUrl;
       });
     } catch (_) {}
   }
@@ -513,6 +729,7 @@ class _HomePageState extends State<HomePage> {
     s.javbusUrl = _javbusCtl.text.trim();
     s.javdbUrl = _javdbCtl.text.trim();
     s.proxy = _proxyCtl.text.trim();
+    s.subUrl = _subCtl.text.trim();
   }
 
   Future<void> _saveCfg() async {
@@ -556,7 +773,8 @@ class _HomePageState extends State<HomePage> {
   /// 返回 0=成功 1=跳过 2=失败
   Future<int> _processOne(Net net, File file) async {
     final name = p.basename(file.path);
-    final base = p.withoutExtension(file.path);
+    final stem = p.basenameWithoutExtension(file.path);
+    var base = p.withoutExtension(file.path);
 
     if (s.skipExisting && File('$base.nfo').existsSync()) {
       _log('⏭ 已有 NFO，跳过：$name');
@@ -585,6 +803,21 @@ class _HomePageState extends State<HomePage> {
     }
     final m = mergeAll(num, got);
 
+    // 整理：新建文件夹，把视频和同名附属文件移进去
+    var organized = '';
+    if (s.organize) {
+      var destDir = file.parent.path;
+      final folder = folderNameFor(m, s.folderMode, stem);
+      if (p.basename(destDir) != folder) destDir = p.join(destDir, folder);
+      try {
+        final moved = await organizeInto(file, destDir);
+        base = p.withoutExtension(moved);
+        organized = folder;
+      } catch (e) {
+        _log('   ⚠️ 整理失败：${errText(e)}（资料仍保存在原位置）');
+      }
+    }
+
     var coverOk = false;
     if (s.downloadCover && m.covers.isNotEmpty) {
       final res = await fetchCover(net, m.covers, _log);
@@ -597,12 +830,68 @@ class _HomePageState extends State<HomePage> {
       }
     }
     await File('$base.nfo').writeAsString(buildNfo(m));
-    _log('✅ ${m.title}\n   来源：${m.sources.join(' + ')}   '
-        '封面：${s.downloadCover ? (coverOk ? '✓' : '✗') : '未开启'}');
+
+    var subNote = '';
+    if (s.downloadSub) {
+      if (hasSubtitle(base)) {
+        subNote = '字幕：已有';
+      } else {
+        try {
+          final sub = await fetchSubtitle(net, s.subUrl, num, _log);
+          if (sub != null) {
+            await File('$base.${sub.$2}.srt').writeAsBytes(sub.$1);
+            subNote = '字幕：✓';
+          } else {
+            subNote = '字幕：✗';
+          }
+        } catch (e) {
+          _log('   · 字幕：失败 ${errText(e)}');
+          subNote = '字幕：✗';
+        }
+      }
+    }
+
+    final tail = [
+      '来源：${m.sources.join(' + ')}',
+      '封面：${s.downloadCover ? (coverOk ? '✓' : '✗') : '未开启'}',
+      if (organized.isNotEmpty) '📁 $organized/',
+      if (subNote.isNotEmpty) subNote,
+    ].join('   ');
+    _log('✅ ${m.title}\n   $tail');
     return 0;
   }
 
-  Future<void> _start() async {
+  /// 只下载字幕（不刮削、不移动文件）。返回 0=成功 1=跳过 2=失败
+  Future<int> _subOne(Net net, File file) async {
+    final name = p.basename(file.path);
+    final base = p.withoutExtension(file.path);
+    if (hasSubtitle(base)) {
+      _log('⏭ 已有字幕，跳过：$name');
+      return 1;
+    }
+    final num = extractCode(name);
+    if (num == null) {
+      _log('❓ 未识别番号：$name');
+      return 2;
+    }
+    _log('🔎 $num   ($name)');
+    try {
+      final sub = await fetchSubtitle(net, s.subUrl, num, _log);
+      if (sub == null) {
+        _log('   ✖ 没有找到中文字幕');
+        return 2;
+      }
+      final out = '$base.${sub.$2}.srt';
+      await File(out).writeAsBytes(sub.$1);
+      _log('✅ 字幕已保存：${p.basename(out)}');
+      return 0;
+    } catch (e) {
+      _log('   ✖ 字幕失败：${errText(e)}');
+      return 2;
+    }
+  }
+
+  Future<void> _start({bool subsOnly = false}) async {
     if (_running) return;
     if (!await _ensurePermission()) {
       _log('❌ 没有获得「所有文件访问权限」。请在系统设置里给本应用开启后重试。');
@@ -621,7 +910,7 @@ class _HomePageState extends State<HomePage> {
       _total = 0;
       _logs.clear();
     });
-    _log('📂 扫描：$dir');
+    _log('📂 扫描：$dir${subsOnly ? '（只下载字幕）' : ''}');
 
     final files = <File>[];
     try {
@@ -648,7 +937,9 @@ class _HomePageState extends State<HomePage> {
         }
         var code = 2;
         try {
-          code = await _processOne(net, file);
+          code = subsOnly
+              ? await _subOne(net, file)
+              : await _processOne(net, file);
         } catch (e) {
           _log('❌ 出错：${errText(e)}');
         }
@@ -682,6 +973,28 @@ class _HomePageState extends State<HomePage> {
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                const Text('外观',
+                    style: TextStyle(fontWeight: FontWeight.bold)),
+                const SizedBox(height: 8),
+                SegmentedButton<ThemeMode>(
+                  showSelectedIcon: false,
+                  segments: const [
+                    ButtonSegment(
+                        value: ThemeMode.system, label: Text('跟随系统')),
+                    ButtonSegment(value: ThemeMode.light, label: Text('浅色')),
+                    ButtonSegment(value: ThemeMode.dark, label: Text('夜间')),
+                  ],
+                  selected: {themeNotifier.value},
+                  onSelectionChanged: (v) {
+                    setM(() {
+                      themeNotifier.value = v.first;
+                      s.themeMode = themeToString(v.first);
+                    });
+                    _syncCfg();
+                    _saveCfg();
+                  },
+                ),
+                const SizedBox(height: 16),
                 const Text('刮削源（可多选，结果会合并）',
                     style: TextStyle(fontWeight: FontWeight.bold)),
                 const SizedBox(height: 8),
@@ -732,6 +1045,38 @@ class _HomePageState extends State<HomePage> {
                     isDense: true,
                   ),
                 ),
+                const SizedBox(height: 16),
+                const Text('整理',
+                    style: TextStyle(fontWeight: FontWeight.bold)),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('刮削成功后整理到文件夹'),
+                  subtitle: const Text('新建文件夹，把视频和资料一起移进去'),
+                  value: s.organize,
+                  onChanged: (v) => setM(() => s.organize = v),
+                ),
+                if (s.organize)
+                  Wrap(
+                    spacing: 8,
+                    children: [
+                      ChoiceChip(
+                        label: const Text('文件夹名：番号'),
+                        selected: s.folderMode == 'num',
+                        onSelected: (_) => setM(() => s.folderMode = 'num'),
+                      ),
+                      ChoiceChip(
+                        label: const Text('番号+标题'),
+                        selected: s.folderMode == 'numTitle',
+                        onSelected: (_) =>
+                            setM(() => s.folderMode = 'numTitle'),
+                      ),
+                      ChoiceChip(
+                        label: const Text('原文件名'),
+                        selected: s.folderMode == 'orig',
+                        onSelected: (_) => setM(() => s.folderMode = 'orig'),
+                      ),
+                    ],
+                  ),
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
                   title: const Text('已有 NFO 的视频跳过'),
@@ -744,12 +1089,32 @@ class _HomePageState extends State<HomePage> {
                   value: s.downloadCover,
                   onChanged: (v) => setM(() => s.downloadCover = v),
                 ),
+                const SizedBox(height: 8),
+                const Text('字幕（实验性）',
+                    style: TextStyle(fontWeight: FontWeight.bold)),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('刮削时自动下载中文字幕'),
+                  value: s.downloadSub,
+                  onChanged: (v) => setM(() => s.downloadSub = v),
+                ),
+                TextField(
+                  controller: _subCtl,
+                  decoration: const InputDecoration(
+                    labelText: '字幕站网址',
+                    border: OutlineInputBorder(),
+                    isDense: true,
+                  ),
+                ),
               ],
             ),
           ),
         ),
       ),
-    ).whenComplete(_syncCfg);
+    ).whenComplete(() {
+      _syncCfg();
+      _saveCfg();
+    });
   }
 
   @override
@@ -783,9 +1148,9 @@ class _HomePageState extends State<HomePage> {
               children: [
                 Expanded(
                   child: FilledButton.icon(
-                    onPressed: _running ? null : _start,
+                    onPressed: _running ? null : () => _start(),
                     icon: const Icon(Icons.folder_open),
-                    label: Text(_running ? '刮削中…' : '选择文件夹并开始刮削'),
+                    label: Text(_running ? '处理中…' : '选择文件夹并开始刮削'),
                   ),
                 ),
                 if (_running) ...[
@@ -796,6 +1161,15 @@ class _HomePageState extends State<HomePage> {
                   ),
                 ],
               ],
+            ),
+            const SizedBox(height: 8),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.tonalIcon(
+                onPressed: _running ? null : () => _start(subsOnly: true),
+                icon: const Icon(Icons.subtitles),
+                label: const Text('只下载字幕'),
+              ),
             ),
             if (_running || _total > 0) ...[
               const SizedBox(height: 12),
