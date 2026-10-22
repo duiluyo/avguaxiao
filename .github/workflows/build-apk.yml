@@ -33,6 +33,7 @@ jobs:
       - name: 添加安卓权限（联网 + 读写存储）
         run: |
           python3 - <<'EOF'
+          import re
           path = 'android/app/src/main/AndroidManifest.xml'
           s = open(path, encoding='utf-8').read()
           if 'MANAGE_EXTERNAL_STORAGE' not in s:
@@ -44,7 +45,8 @@ jobs:
                   '    '
               )
               s = s.replace('<application', perms + '<application', 1)
-              open(path, 'w', encoding='utf-8').write(s)
+          s = re.sub(r'android:label="[^"]*"', 'android:label="影片刮削器"', s, count=1)
+          open(path, 'w', encoding='utf-8').write(s)
           EOF
 
       - name: 提高 compileSdk 到 37（permission_handler 需要）
