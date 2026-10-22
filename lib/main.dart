@@ -1,10 +1,17 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:html/dom.dart' as dom;
 import 'package:html/parser.dart' as html_parser;
 import 'package:http/http.dart' as http;
+import 'package:http/io_client.dart';
+import 'package:image/image.dart' as img;
 import 'package:path/path.dart' as p;
 import 'package:permission_handler/permission_handler.dart';
 
@@ -23,36 +30,119 @@ class ScraperApp extends StatelessWidget {
   }
 }
 
-// ───────────────────────── 数据模型 ─────────────────────────
+// ═══════════════════════ 配置 ═══════════════════════
 
-class MovieInfo {
-  final String num;
-  String title = '';
-  String cover = '';
-  String date = '';
-  int runtime = 0;
-  String studio = '';
-  String director = '';
-  String series = '';
-  List<String> genres = [];
-  List<String> actors = [];
-  MovieInfo(this.num);
+const _cfgPath = '/storage/emulated/0/刮削器/config.json';
+
+class Cfg {
+  String javbusUrl = 'https://www.javbus.com';
+  String javdbUrl = 'https://javdb.com';
+  String proxy = '';
+  bool useJavbus = true;
+  bool useJavdb = true;
+  bool useDmm = true;
+  bool skipExisting = true;
+  bool downloadCover = true;
+
+  Map<String, dynamic> toJson() => {
+        'javbusUrl': javbusUrl,
+        'javdbUrl': javdbUrl,
+        'proxy': proxy,
+        'useJavbus': useJavbus,
+        'useJavdb': useJavdb,
+        'useDmm': useDmm,
+        'skipExisting': skipExisting,
+        'downloadCover': downloadCover,
+      };
+
+  void load(Map<String, dynamic> j) {
+    javbusUrl = (j['javbusUrl'] ?? javbusUrl) as String;
+    javdbUrl = (j['javdbUrl'] ?? javdbUrl) as String;
+    proxy = (j['proxy'] ?? proxy) as String;
+    useJavbus = (j['useJavbus'] ?? useJavbus) as bool;
+    useJavdb = (j['useJavdb'] ?? useJavdb) as bool;
+    useDmm = (j['useDmm'] ?? useDmm) as bool;
+    skipExisting = (j['skipExisting'] ?? skipExisting) as bool;
+    downloadCover = (j['downloadCover'] ?? downloadCover) as bool;
+  }
 }
 
-// ───────────────────────── 番号识别 ─────────────────────────
+// ═══════════════════════ 网络 ═══════════════════════
+
+const _ua = 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36';
+
+class Net {
+  late final http.Client _client;
+
+  Net(String proxy) {
+    final hc = HttpClient()..connectionTimeout = const Duration(seconds: 15);
+    final px = proxy
+        .trim()
+        .replaceFirst(RegExp(r'^[a-zA-Z]+://'), '')
+        .replaceAll(RegExp(r'/+$'), '');
+    if (px.isNotEmpty) {
+      hc.findProxy = (uri) => 'PROXY $px';
+    }
+    _client = IOClient(hc);
+  }
+
+  void close() => _client.close();
+
+  Future<http.Response> get(String url, {Map<String, String>? extra}) async {
+    final uri = Uri.parse(url);
+    final headers = <String, String>{
+      'User-Agent': _ua,
+      'Accept-Language': 'zh-CN,zh;q=0.9,ja;q=0.8,en;q=0.7',
+      'Referer': '${uri.scheme}://${uri.host}/',
+      if (extra != null) ...extra,
+    };
+    Object? last;
+    for (var i = 0; i < 2; i++) {
+      try {
+        return await _client
+            .get(uri, headers: headers)
+            .timeout(const Duration(seconds: 25));
+      } catch (e) {
+        last = e;
+      }
+    }
+    throw last!;
+  }
+}
+
+String decodeBody(http.Response r) =>
+    utf8.decode(r.bodyBytes, allowMalformed: true);
+
+bool looksBlocked(String body) =>
+    body.contains('Just a moment') ||
+    body.contains('cf-browser-verification') ||
+    body.contains('Attention Required');
+
+String trimSlash(String s) => s.trim().replaceAll(RegExp(r'/+$'), '');
+
+String errText(Object e) {
+  if (e is TimeoutException) return '超时（网络慢，或需要代理）';
+  if (e is SocketException || e is http.ClientException) {
+    return '连接失败（可能需要代理）';
+  }
+  final s = e.toString();
+  return s.length > 80 ? '${s.substring(0, 80)}…' : s;
+}
+
+// ═══════════════════════ 番号识别 ═══════════════════════
 
 const _videoExts = {
   '.mp4', '.mkv', '.avi', '.wmv', '.mov', '.ts', '.m2ts',
   '.flv', '.rmvb', '.mpg', '.webm',
 };
 
-// 容易被误识别成番号的常见编码/清晰度字样
 const _bannedPrefix = {
   'AVC', 'HEVC', 'AAC', 'FHD', 'UHD', 'WEB', 'BLURAY', 'HDTV', 'DVD',
   'CD', 'PART', 'DISC', 'HD', 'SD', 'DDP', 'DTS', 'EAC', 'AC', 'MP',
 };
 
-/// 从文件名里提取番号，例如 "[xxx] ssis00123 1080p.mp4" -> "SSIS-123"
+/// "[xxx] ssis00123 1080p.mp4" -> "SSIS-123"
 String? extractCode(String filename) {
   final base = p.basenameWithoutExtension(filename);
   final re = RegExp(r'(?<![A-Za-z0-9])([A-Za-z]{2,6})[-_ ]?(\d{2,5})(?!\d)');
@@ -60,93 +150,266 @@ String? extractCode(String filename) {
     final letters = m.group(1)!.toUpperCase();
     if (_bannedPrefix.contains(letters)) continue;
     final n = int.parse(m.group(2)!);
-    final digits = n.toString().padLeft(3, '0');
-    return '$letters-$digits';
+    return '$letters-${n.toString().padLeft(3, '0')}';
   }
   return null;
 }
 
-// ───────────────────────── 抓取资料 ─────────────────────────
+// ═══════════════════════ 数据模型 ═══════════════════════
 
-Map<String, String> _headers(String base) => {
-      'User-Agent':
-          'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 '
-              '(KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36',
-      'Accept-Language': 'zh-CN,zh;q=0.9',
-      'Cookie': 'existmag=all; age=verified; dv=1',
-      'Referer': base,
-    };
+/// 单个来源抓到的资料
+class Partial {
+  final String source;
+  String url = '';
+  String title = '';
+  String date = '';
+  String studio = '';
+  String director = '';
+  String series = '';
+  int runtime = 0;
+  List<String> genres = [];
+  List<String> actors = [];
+  List<String> covers = [];
+  Partial(this.source);
+  bool get hasMeta => title.isNotEmpty;
+}
 
-Future<MovieInfo?> fetchMovie(String num, String baseUrl) async {
-  final base = baseUrl.replaceAll(RegExp(r'/+$'), '');
-  final url = Uri.parse('$base/$num');
-  final resp = await http
-      .get(url, headers: _headers(base))
-      .timeout(const Duration(seconds: 20));
-  if (resp.statusCode != 200) return null;
+/// 合并后的最终资料
+class Movie {
+  final String num;
+  String title = '';
+  String date = '';
+  String studio = '';
+  String director = '';
+  String series = '';
+  int runtime = 0;
+  List<String> genres = [];
+  List<String> actors = [];
+  List<String> covers = [];
+  List<String> sources = [];
+  List<String> urls = [];
+  Movie(this.num);
+}
 
-  final doc = html_parser
-      .parse(utf8.decode(resp.bodyBytes, allowMalformed: true));
+void _union(List<String> to, List<String> from) {
+  for (final x in from) {
+    if (x.isNotEmpty && !to.contains(x)) to.add(x);
+  }
+}
+
+/// 按来源优先级合并：单值字段取第一个非空；列表字段取并集
+Movie mergeAll(String num, List<Partial> parts) {
+  final m = Movie(num);
+  for (final part in parts) {
+    if (m.title.isEmpty) m.title = part.title;
+    if (m.date.isEmpty) m.date = part.date;
+    if (m.studio.isEmpty) m.studio = part.studio;
+    if (m.director.isEmpty) m.director = part.director;
+    if (m.series.isEmpty) m.series = part.series;
+    if (m.runtime == 0) m.runtime = part.runtime;
+    _union(m.genres, part.genres);
+    _union(m.actors, part.actors);
+    _union(m.covers, part.covers);
+    if (part.hasMeta) m.sources.add(part.source);
+    if (part.url.isNotEmpty) m.urls.add(part.url);
+  }
+  return m;
+}
+
+// ═══════════════════════ 刮削源 ═══════════════════════
+
+List<String> _texts(dom.Element? e, String selector) {
+  if (e == null) return [];
+  return e
+      .querySelectorAll(selector)
+      .map((x) => x.text.trim())
+      .where((s) => s.isNotEmpty)
+      .toList();
+}
+
+/// 来源 1：JavBus（同结构的镜像站也可以填进来）
+Future<Partial?> scrapeJavbus(Net net, String baseUrl, String num) async {
+  final base = trimSlash(baseUrl);
+  final url = '$base/$num';
+  final r = await net
+      .get(url, extra: {'Cookie': 'existmag=all; age=verified; dv=1'});
+  if (r.statusCode == 404) return null;
+  if (r.statusCode != 200) throw 'HTTP ${r.statusCode}';
+  final body = decodeBody(r);
+  if (looksBlocked(body)) throw '被网站拦截（Cloudflare）';
+  final doc = html_parser.parse(body);
   final h3 = doc.querySelector('div.container h3');
-  if (h3 == null) return null;
+  if (h3 == null) throw '页面结构不符（可能被拦截，或需要代理）';
 
-  final info = MovieInfo(num);
-
+  final out = Partial('JavBus')..url = url;
   var title = h3.text.trim();
   if (title.toUpperCase().startsWith(num)) {
     title = title.substring(num.length).trim();
   }
-  info.title = title;
+  out.title = title;
 
   final big = doc.querySelector('a.bigImage');
-  var cover = big?.attributes['href'] ??
-      big?.querySelector('img')?.attributes['src'] ??
-      '';
-  if (cover.isNotEmpty) cover = url.resolve(cover).toString();
-  info.cover = cover;
+  final page = Uri.parse(url);
+  for (final c in [
+    big?.attributes['href'],
+    big?.querySelector('img')?.attributes['src'],
+  ]) {
+    if (c != null && c.isNotEmpty) {
+      final full = page.resolve(c).toString();
+      if (!out.covers.contains(full)) out.covers.add(full);
+    }
+  }
 
   final box = doc.querySelector('div.info');
   if (box != null) {
     final text = box.text;
-    info.date =
-        RegExp(r'\d{4}-\d{2}-\d{2}').firstMatch(text)?.group(0) ?? '';
+    out.date = RegExp(r'\d{4}-\d{2}-\d{2}').firstMatch(text)?.group(0) ?? '';
     final rt = RegExp(r'(\d+)\s*(?:分鐘|分钟|min)').firstMatch(text);
-    info.runtime = int.tryParse(rt?.group(1) ?? '') ?? 0;
-
+    out.runtime = int.tryParse(rt?.group(1) ?? '') ?? 0;
     String first(String key) =>
         box.querySelector('a[href*="/$key/"]')?.text.trim() ?? '';
-    info.studio = first('studio');
-    info.director = first('director');
-    info.series = first('series');
-
-    info.genres = box
-        .querySelectorAll('a[href*="/genre/"]')
-        .map((e) => e.text.trim())
-        .where((s) => s.isNotEmpty)
-        .toSet()
-        .toList();
+    out.studio = first('studio');
+    out.director = first('director');
+    out.series = first('series');
+    out.genres = _texts(box, 'a[href*="/genre/"]');
   }
-
-  info.actors = doc
+  out.actors = doc
       .querySelectorAll('div.star-name a')
       .map((e) => (e.attributes['title'] ?? e.text).trim())
       .where((s) => s.isNotEmpty)
-      .toSet()
       .toList();
-
-  return info;
+  return out;
 }
 
-Future<bool> downloadCover(String url, String savePath, String base) async {
-  final resp = await http
-      .get(Uri.parse(url), headers: _headers(base))
-      .timeout(const Duration(seconds: 30));
-  if (resp.statusCode != 200 || resp.bodyBytes.isEmpty) return false;
-  await File(savePath).writeAsBytes(resp.bodyBytes);
-  return true;
+/// 来源 2：JavDB（有时会被 Cloudflare 拦截，失败会在日志里写明）
+Future<Partial?> scrapeJavdb(Net net, String baseUrl, String num) async {
+  final base = trimSlash(baseUrl);
+  const ck = {'Cookie': 'over18=1; locale=zh'};
+
+  final sr = await net.get(
+      '$base/search?q=${Uri.encodeQueryComponent(num)}&f=all',
+      extra: ck);
+  if (sr.statusCode != 200) throw '搜索页 HTTP ${sr.statusCode}';
+  final sbody = decodeBody(sr);
+  if (looksBlocked(sbody)) throw '被网站拦截（Cloudflare）';
+  final sdoc = html_parser.parse(sbody);
+
+  String? href;
+  for (final a in sdoc.querySelectorAll('a.box')) {
+    final t = a.querySelector('.video-title strong')?.text.trim() ?? '';
+    if (t.toUpperCase() == num) {
+      href = a.attributes['href'];
+      break;
+    }
+  }
+  if (href == null) return null;
+
+  final durl = Uri.parse('$base/').resolve(href).toString();
+  final dr = await net.get(durl, extra: ck);
+  if (dr.statusCode != 200) throw '详情页 HTTP ${dr.statusCode}';
+  final dbody = decodeBody(dr);
+  if (looksBlocked(dbody)) throw '被网站拦截（Cloudflare）';
+  final doc = html_parser.parse(dbody);
+
+  final out = Partial('JavDB')..url = durl;
+  out.title =
+      doc.querySelector('h2.title strong.current-title')?.text.trim() ?? '';
+  if (out.title.isEmpty) throw '详情页结构不符';
+
+  final coverSrc = doc.querySelector('img.video-cover')?.attributes['src'] ??
+      doc.querySelector('.column-video-cover img')?.attributes['src'] ??
+      '';
+  if (coverSrc.isNotEmpty) {
+    out.covers.add(Uri.parse(durl).resolve(coverSrc).toString());
+  }
+
+  for (final blk in doc.querySelectorAll('.panel-block')) {
+    final label = blk.querySelector('strong')?.text ?? '';
+    final value = blk.querySelector('.value');
+    if (value == null) continue;
+    final vt = value.text.trim();
+    final links = _texts(value, 'a');
+    if (label.contains('日期')) {
+      out.date = RegExp(r'\d{4}-\d{2}-\d{2}').firstMatch(vt)?.group(0) ?? '';
+    } else if (label.contains('時長') || label.contains('时长')) {
+      out.runtime = int.tryParse(RegExp(r'\d+').firstMatch(vt)?.group(0) ?? '') ?? 0;
+    } else if (label.contains('導演') || label.contains('导演')) {
+      out.director = links.isNotEmpty ? links.first : vt;
+    } else if (label.contains('片商')) {
+      out.studio = links.isNotEmpty ? links.first : vt;
+    } else if (label.contains('系列')) {
+      out.series = links.isNotEmpty ? links.first : vt;
+    } else if (label.contains('類別') || label.contains('类别')) {
+      out.genres = links;
+    } else if (label.contains('演員') || label.contains('演员')) {
+      out.actors = links;
+    }
+  }
+  return out;
 }
 
-// ───────────────────────── 生成 NFO ─────────────────────────
+/// 来源 3：DMM 官方图床，按番号猜封面地址（只提供封面）
+List<String> dmmCovers(String num) {
+  final m = RegExp(r'^([A-Z]+)-(\d+)$').firstMatch(num);
+  if (m == null) return [];
+  final label = m.group(1)!.toLowerCase();
+  final digits = m.group(2)!.padLeft(5, '0');
+  final cid = '$label$digits';
+  return [
+    'https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/$cid/${cid}pl.jpg',
+    'https://pics.dmm.co.jp/digital/video/$cid/${cid}pl.jpg',
+    'https://pics.dmm.co.jp/mono/movie/adult/$cid/${cid}pl.jpg',
+  ];
+}
+
+// ═══════════════════════ 封面 ═══════════════════════
+
+bool _isImage(Uint8List b) {
+  if (b.length < 4) return false;
+  final jpg = b[0] == 0xFF && b[1] == 0xD8;
+  final png = b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47;
+  return jpg || png;
+}
+
+String _short(String u) => u.length > 70 ? '${u.substring(0, 70)}…' : u;
+
+/// 依次尝试每个候选地址，返回第一张下载成功的图片
+Future<(Uint8List, String)?> fetchCover(
+    Net net, List<String> urls, void Function(String) log) async {
+  final fails = <String>[];
+  for (final raw in urls) {
+    final u = raw.replaceFirst(RegExp(r'^http://'), 'https://');
+    try {
+      final r = await net.get(u);
+      final b = r.bodyBytes;
+      if (r.statusCode == 200 && b.length > 5000 && _isImage(b)) {
+        return (b, u);
+      }
+      fails.add('HTTP ${r.statusCode}（${b.length}字节）${_short(u)}');
+    } catch (e) {
+      fails.add('${errText(e)} ${_short(u)}');
+    }
+  }
+  for (final f in fails.take(5)) {
+    log('   封面失败：$f');
+  }
+  return null;
+}
+
+/// 横版封面裁出右半边做竖版海报（在后台线程执行）
+Uint8List? makePoster(Uint8List bytes) {
+  final im = img.decodeImage(bytes);
+  if (im == null) return null;
+  if (im.width > im.height * 1.2) {
+    final x = (im.width * 0.4733).round();
+    final c = img.copyCrop(im,
+        x: x, y: 0, width: im.width - x, height: im.height);
+    return Uint8List.fromList(img.encodeJpg(c, quality: 92));
+  }
+  return null;
+}
+
+// ═══════════════════════ NFO ═══════════════════════
 
 String _x(String s) => s
     .replaceAll('&', '&amp;')
@@ -154,7 +417,7 @@ String _x(String s) => s
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;');
 
-String buildNfo(MovieInfo m) {
+String buildNfo(Movie m) {
   final year = m.date.length >= 4 ? m.date.substring(0, 4) : '';
   final b = StringBuffer();
   b.writeln('<?xml version="1.0" encoding="utf-8" standalone="yes"?>');
@@ -185,11 +448,14 @@ String buildNfo(MovieInfo m) {
     b.writeln('    <type>Actor</type>');
     b.writeln('  </actor>');
   }
+  for (final u in m.urls) {
+    b.writeln('  <website>${_x(u)}</website>');
+  }
   b.writeln('</movie>');
   return b.toString();
 }
 
-// ───────────────────────── 界面 ─────────────────────────
+// ═══════════════════════ 界面 ═══════════════════════
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -199,23 +465,67 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
-  final _baseCtl = TextEditingController(text: 'https://www.javbus.com');
+  final s = Cfg();
+  final _javbusCtl = TextEditingController();
+  final _javdbCtl = TextEditingController();
+  final _proxyCtl = TextEditingController();
   final _logs = <String>[];
   final _scroll = ScrollController();
   bool _running = false;
+  bool _cancel = false;
   int _done = 0;
   int _total = 0;
 
   @override
+  void initState() {
+    super.initState();
+    _javbusCtl.text = s.javbusUrl;
+    _javdbCtl.text = s.javdbUrl;
+    _proxyCtl.text = s.proxy;
+    _loadCfg();
+  }
+
+  @override
   void dispose() {
-    _baseCtl.dispose();
+    _javbusCtl.dispose();
+    _javdbCtl.dispose();
+    _proxyCtl.dispose();
     _scroll.dispose();
     super.dispose();
   }
 
-  void _log(String s) {
+  Future<void> _loadCfg() async {
+    try {
+      final f = File(_cfgPath);
+      if (!f.existsSync()) return;
+      final j = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
+      if (!mounted) return;
+      setState(() {
+        s.load(j);
+        _javbusCtl.text = s.javbusUrl;
+        _javdbCtl.text = s.javdbUrl;
+        _proxyCtl.text = s.proxy;
+      });
+    } catch (_) {}
+  }
+
+  void _syncCfg() {
+    s.javbusUrl = _javbusCtl.text.trim();
+    s.javdbUrl = _javdbCtl.text.trim();
+    s.proxy = _proxyCtl.text.trim();
+  }
+
+  Future<void> _saveCfg() async {
+    try {
+      final f = File(_cfgPath);
+      await f.parent.create(recursive: true);
+      await f.writeAsString(jsonEncode(s.toJson()));
+    } catch (_) {}
+  }
+
+  void _log(String t) {
     if (!mounted) return;
-    setState(() => _logs.add(s));
+    setState(() => _logs.add(t));
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (_scroll.hasClients) {
         _scroll.jumpTo(_scroll.position.maxScrollExtent);
@@ -226,26 +536,87 @@ class _HomePageState extends State<HomePage> {
   Future<bool> _ensurePermission() async {
     if (!Platform.isAndroid) return true;
     if (await Permission.manageExternalStorage.isGranted) return true;
-    var s = await Permission.manageExternalStorage.request();
-    if (s.isGranted) return true;
-    s = await Permission.storage.request();
-    return s.isGranted;
+    var st = await Permission.manageExternalStorage.request();
+    if (st.isGranted) return true;
+    st = await Permission.storage.request();
+    return st.isGranted;
+  }
+
+  Future<Partial?> _safe(String name, Future<Partial?> Function() f) async {
+    try {
+      final r = await f();
+      if (r == null) _log('   · $name：没有这个番号');
+      return r;
+    } catch (e) {
+      _log('   · $name：失败 ${errText(e)}');
+      return null;
+    }
+  }
+
+  /// 返回 0=成功 1=跳过 2=失败
+  Future<int> _processOne(Net net, File file) async {
+    final name = p.basename(file.path);
+    final base = p.withoutExtension(file.path);
+
+    if (s.skipExisting && File('$base.nfo').existsSync()) {
+      _log('⏭ 已有 NFO，跳过：$name');
+      return 1;
+    }
+    final num = extractCode(name);
+    if (num == null) {
+      _log('❓ 未识别番号：$name');
+      return 2;
+    }
+    _log('🔎 $num   ($name)');
+
+    final tasks = <Future<Partial?>>[];
+    if (s.useJavbus) {
+      tasks.add(_safe('JavBus', () => scrapeJavbus(net, s.javbusUrl, num)));
+    }
+    if (s.useJavdb) {
+      tasks.add(_safe('JavDB', () => scrapeJavdb(net, s.javdbUrl, num)));
+    }
+    final got = (await Future.wait(tasks)).whereType<Partial>().toList();
+    if (s.useDmm) got.add(Partial('DMM')..covers = dmmCovers(num));
+
+    if (!got.any((e) => e.hasMeta)) {
+      _log('   ✖ 所有来源都没查到资料');
+      return 2;
+    }
+    final m = mergeAll(num, got);
+
+    var coverOk = false;
+    if (s.downloadCover && m.covers.isNotEmpty) {
+      final res = await fetchCover(net, m.covers, _log);
+      if (res != null) {
+        final bytes = res.$1;
+        final poster = await compute(makePoster, bytes);
+        await File('$base-poster.jpg').writeAsBytes(poster ?? bytes);
+        await File('$base-fanart.jpg').writeAsBytes(bytes);
+        coverOk = true;
+      }
+    }
+    await File('$base.nfo').writeAsString(buildNfo(m));
+    _log('✅ ${m.title}\n   来源：${m.sources.join(' + ')}   '
+        '封面：${s.downloadCover ? (coverOk ? '✓' : '✗') : '未开启'}');
+    return 0;
   }
 
   Future<void> _start() async {
     if (_running) return;
-
     if (!await _ensurePermission()) {
       _log('❌ 没有获得「所有文件访问权限」。请在系统设置里给本应用开启后重试。');
       return;
     }
-
     final dir = await FilePicker.platform
         .getDirectoryPath(dialogTitle: '选择存放视频的文件夹');
     if (dir == null) return;
 
+    _syncCfg();
+    await _saveCfg();
     setState(() {
       _running = true;
+      _cancel = false;
       _done = 0;
       _total = 0;
       _logs.clear();
@@ -263,90 +634,168 @@ class _HomePageState extends State<HomePage> {
     } catch (e) {
       _log('⚠️ 扫描时出错（部分目录可能无法访问）：$e');
     }
-
     files.sort((a, b) => a.path.compareTo(b.path));
     setState(() => _total = files.length);
     _log('找到 ${files.length} 个视频文件');
 
-    final baseUrl = _baseCtl.text.trim();
+    final net = Net(s.proxy);
     var ok = 0, skip = 0, fail = 0;
-
-    for (final file in files) {
-      final name = p.basename(file.path);
-      final base = p.withoutExtension(file.path);
-
-      if (File('$base.nfo').existsSync()) {
-        _log('⏭ 已有 NFO，跳过：$name');
-        skip++;
-        setState(() => _done++);
-        continue;
-      }
-
-      final num = extractCode(name);
-      if (num == null) {
-        _log('❓ 未识别番号：$name');
-        fail++;
-        setState(() => _done++);
-        continue;
-      }
-
-      try {
-        final info = await fetchMovie(num, baseUrl);
-        if (info == null) {
-          _log('🔍 没查到 $num：$name');
-          fail++;
-        } else {
-          if (info.cover.isNotEmpty) {
-            final saved =
-                await downloadCover(info.cover, '$base-poster.jpg', baseUrl);
-            if (saved) {
-              await File('$base-poster.jpg').copy('$base-fanart.jpg');
-            } else {
-              _log('⚠️ $num 封面下载失败');
-            }
-          }
-          await File('$base.nfo').writeAsString(buildNfo(info));
-          _log('✅ $num ${info.title}');
-          ok++;
+    try {
+      for (final file in files) {
+        if (_cancel) {
+          _log('⏹ 已停止');
+          break;
         }
-      } catch (e) {
-        _log('❌ $num 出错：$e');
-        fail++;
+        var code = 2;
+        try {
+          code = await _processOne(net, file);
+        } catch (e) {
+          _log('❌ 出错：${errText(e)}');
+        }
+        if (code == 0) ok++;
+        if (code == 1) skip++;
+        if (code == 2) fail++;
+        if (mounted) setState(() => _done++);
+        if (code != 1) await Future.delayed(const Duration(milliseconds: 1500));
       }
-
-      setState(() => _done++);
-      await Future.delayed(const Duration(seconds: 2)); // 礼貌间隔，避免被封
+    } finally {
+      net.close();
     }
-
     _log('🎉 完成：成功 $ok，跳过 $skip，失败/未识别 $fail');
-    setState(() => _running = false);
+    if (mounted) setState(() => _running = false);
+  }
+
+  void _openSettings() {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setM) => Padding(
+          padding: EdgeInsets.only(
+            left: 16,
+            right: 16,
+            top: 16,
+            bottom: MediaQuery.of(ctx).viewInsets.bottom + 16,
+          ),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('刮削源（可多选，结果会合并）',
+                    style: TextStyle(fontWeight: FontWeight.bold)),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  children: [
+                    FilterChip(
+                      label: const Text('JavBus'),
+                      selected: s.useJavbus,
+                      onSelected: (v) => setM(() => s.useJavbus = v),
+                    ),
+                    FilterChip(
+                      label: const Text('JavDB'),
+                      selected: s.useJavdb,
+                      onSelected: (v) => setM(() => s.useJavdb = v),
+                    ),
+                    FilterChip(
+                      label: const Text('DMM 封面'),
+                      selected: s.useDmm,
+                      onSelected: (v) => setM(() => s.useDmm = v),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _javbusCtl,
+                  decoration: const InputDecoration(
+                    labelText: 'JavBus 网址（可换镜像）',
+                    border: OutlineInputBorder(),
+                    isDense: true,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: _javdbCtl,
+                  decoration: const InputDecoration(
+                    labelText: 'JavDB 网址',
+                    border: OutlineInputBorder(),
+                    isDense: true,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: _proxyCtl,
+                  decoration: const InputDecoration(
+                    labelText: 'HTTP 代理（可留空），如 127.0.0.1:7890',
+                    border: OutlineInputBorder(),
+                    isDense: true,
+                  ),
+                ),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('已有 NFO 的视频跳过'),
+                  value: s.skipExisting,
+                  onChanged: (v) => setM(() => s.skipExisting = v),
+                ),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('下载封面'),
+                  value: s.downloadCover,
+                  onChanged: (v) => setM(() => s.downloadCover = v),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    ).whenComplete(_syncCfg);
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('刮削器')),
+      appBar: AppBar(
+        title: const Text('刮削器'),
+        actions: [
+          IconButton(
+            tooltip: '复制日志',
+            icon: const Icon(Icons.copy),
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: _logs.join('\n')));
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('日志已复制')),
+              );
+            },
+          ),
+          IconButton(
+            tooltip: '设置',
+            icon: const Icon(Icons.settings),
+            onPressed: _running ? null : _openSettings,
+          ),
+        ],
+      ),
       body: Padding(
         padding: const EdgeInsets.all(12),
         child: Column(
           children: [
-            TextField(
-              controller: _baseCtl,
-              enabled: !_running,
-              decoration: const InputDecoration(
-                labelText: '数据源网址',
-                border: OutlineInputBorder(),
-                isDense: true,
-              ),
-            ),
-            const SizedBox(height: 12),
-            SizedBox(
-              width: double.infinity,
-              child: FilledButton.icon(
-                onPressed: _running ? null : _start,
-                icon: const Icon(Icons.folder_open),
-                label: Text(_running ? '刮削中…' : '选择文件夹并开始刮削'),
-              ),
+            Row(
+              children: [
+                Expanded(
+                  child: FilledButton.icon(
+                    onPressed: _running ? null : _start,
+                    icon: const Icon(Icons.folder_open),
+                    label: Text(_running ? '刮削中…' : '选择文件夹并开始刮削'),
+                  ),
+                ),
+                if (_running) ...[
+                  const SizedBox(width: 8),
+                  OutlinedButton(
+                    onPressed: () => setState(() => _cancel = true),
+                    child: const Text('停止'),
+                  ),
+                ],
+              ],
             ),
             if (_running || _total > 0) ...[
               const SizedBox(height: 12),
@@ -358,12 +807,14 @@ class _HomePageState extends State<HomePage> {
             ],
             const SizedBox(height: 8),
             Expanded(
-              child: ListView.builder(
-                controller: _scroll,
-                itemCount: _logs.length,
-                itemBuilder: (_, i) => Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 2),
-                  child: Text(_logs[i], style: const TextStyle(fontSize: 13)),
+              child: SelectionArea(
+                child: ListView.builder(
+                  controller: _scroll,
+                  itemCount: _logs.length,
+                  itemBuilder: (_, i) => Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 2),
+                    child: Text(_logs[i], style: const TextStyle(fontSize: 13)),
+                  ),
                 ),
               ),
             ),
