@@ -15,6 +15,9 @@ import 'package:image/image.dart' as img;
 import 'package:path/path.dart' as p;
 import 'package:permission_handler/permission_handler.dart';
 
+/// 每次修改代码都要同步修改这里和 pubspec.yaml 里的 version
+const appVersion = '1.2.1';
+
 void main() => runApp(const ScraperApp());
 
 final themeNotifier = ValueNotifier<ThemeMode>(ThemeMode.system);
@@ -39,7 +42,7 @@ class ScraperApp extends StatelessWidget {
     return ValueListenableBuilder<ThemeMode>(
       valueListenable: themeNotifier,
       builder: (context, mode, _) => MaterialApp(
-        title: '刮削器',
+        title: '影片刮削器',
         themeMode: mode,
         theme: ThemeData(colorSchemeSeed: Colors.indigo, useMaterial3: true),
         darkTheme: ThemeData(
@@ -910,6 +913,7 @@ class _HomePageState extends State<HomePage> {
       _total = 0;
       _logs.clear();
     });
+    _log('影片刮削器 v$appVersion');
     _log('📂 扫描：$dir${subsOnly ? '（只下载字幕）' : ''}');
 
     final files = <File>[];
@@ -1121,7 +1125,7 @@ class _HomePageState extends State<HomePage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('刮削器'),
+        title: const Text('影片刮削器 v$appVersion'),
         actions: [
           IconButton(
             tooltip: '复制日志',
