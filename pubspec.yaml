@@ -1,0 +1,19 @@
+name: video_scraper
+description: 本地视频刮削器
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  file_picker: ^8.1.6
+  http: ^1.2.2
+  html: ^0.15.4
+  path: ^1.9.0
+  permission_handler: ^11.3.1
+
+flutter:
+  uses-material-design: true
