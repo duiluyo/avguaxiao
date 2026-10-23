@@ -14,9 +14,10 @@ import 'package:http/io_client.dart';
 import 'package:image/image.dart' as img;
 import 'package:path/path.dart' as p;
 import 'package:permission_handler/permission_handler.dart';
+import 'package:smb_connect/smb_connect.dart' as smb;
 
 /// 每次修改代码都要同步修改这里和 pubspec.yaml 里的 version
-const appVersion = '1.3.0';
+const appVersion = '1.4.0';
 
 void main() => runApp(const ScraperApp());
 
@@ -75,6 +76,16 @@ class Cfg {
   String subUrl = 'https://www.subtitlecat.com';
   String themeMode = 'system';
   bool keepAwake = true;
+  String source = 'local'; // local=本机 smb=网络共享
+  String smbHost = '';
+  String smbUser = '';
+  String smbPass = '';
+  String smbDomain = '';
+  String smbPath = '';
+  bool downloadStills = false;
+  int stillsMax = 10;
+  bool translate = false;
+  String trLang = 'zh-CN';
 
   Map<String, dynamic> toJson() => {
         'javbusUrl': javbusUrl,
@@ -91,6 +102,16 @@ class Cfg {
         'subUrl': subUrl,
         'themeMode': themeMode,
         'keepAwake': keepAwake,
+        'source': source,
+        'smbHost': smbHost,
+        'smbUser': smbUser,
+        'smbPass': smbPass,
+        'smbDomain': smbDomain,
+        'smbPath': smbPath,
+        'downloadStills': downloadStills,
+        'stillsMax': stillsMax,
+        'translate': translate,
+        'trLang': trLang,
       };
 
   void load(Map<String, dynamic> j) {
@@ -108,6 +129,16 @@ class Cfg {
     subUrl = (j['subUrl'] ?? subUrl) as String;
     themeMode = (j['themeMode'] ?? themeMode) as String;
     keepAwake = (j['keepAwake'] ?? keepAwake) as bool;
+    source = (j['source'] ?? source) as String;
+    smbHost = (j['smbHost'] ?? smbHost) as String;
+    smbUser = (j['smbUser'] ?? smbUser) as String;
+    smbPass = (j['smbPass'] ?? smbPass) as String;
+    smbDomain = (j['smbDomain'] ?? smbDomain) as String;
+    smbPath = (j['smbPath'] ?? smbPath) as String;
+    downloadStills = (j['downloadStills'] ?? downloadStills) as bool;
+    stillsMax = (j['stillsMax'] ?? stillsMax) as int;
+    translate = (j['translate'] ?? translate) as bool;
+    trLang = (j['trLang'] ?? trLang) as String;
   }
 }
 
@@ -261,6 +292,7 @@ class Partial {
   List<String> genres = [];
   List<String> actors = [];
   List<String> covers = [];
+  List<String> stills = [];
   Partial(this.source);
   bool get hasMeta => title.isNotEmpty;
 }
@@ -279,7 +311,11 @@ class Movie {
   List<String> covers = [];
   List<String> sources = [];
   List<String> urls = [];
+  List<String> stills = [];
+  String titleZh = '';
+  bool translated = false;
   Movie(this.num);
+  String get displayTitle => titleZh.isNotEmpty ? titleZh : title;
 }
 
 void _union(List<String> to, List<String> from) {
@@ -301,6 +337,7 @@ Movie mergeAll(String num, List<Partial> parts) {
     _union(m.genres, part.genres);
     _union(m.actors, part.actors);
     _union(m.covers, part.covers);
+    if (m.stills.isEmpty && part.stills.isNotEmpty) m.stills = List.of(part.stills);
     if (part.hasMeta) m.sources.add(part.source);
     if (part.url.isNotEmpty) m.urls.add(part.url);
   }
@@ -369,6 +406,12 @@ Future<Partial?> scrapeJavbus(Net net, String baseUrl, String num) async {
       .map((e) => (e.attributes['title'] ?? e.text).trim())
       .where((s) => s.isNotEmpty)
       .toList();
+  out.stills = doc
+      .querySelectorAll('a.sample-box')
+      .map((e) => e.attributes['href'] ?? '')
+      .where((s) => s.isNotEmpty)
+      .map((s) => page.resolve(s).toString())
+      .toList();
   return out;
 }
 
@@ -436,6 +479,13 @@ Future<Partial?> scrapeJavdb(Net net, String baseUrl, String num) async {
       out.actors = links;
     }
   }
+  out.stills = doc
+      .querySelectorAll('.preview-images a.tile-item')
+      .map((e) => e.attributes['href'] ?? '')
+      .where((s) =>
+          RegExp(r'\.(jpe?g|png|webp)(\?|$)', caseSensitive: false).hasMatch(s))
+      .map((s) => Uri.parse(durl).resolve(s).toString())
+      .toList();
   return out;
 }
 
@@ -459,7 +509,10 @@ bool _isImage(Uint8List b) {
   if (b.length < 4) return false;
   final jpg = b[0] == 0xFF && b[1] == 0xD8;
   final png = b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47;
-  return jpg || png;
+  final webp = b.length > 12 &&
+      b[0] == 0x52 && b[1] == 0x49 && b[2] == 0x46 && b[3] == 0x46 &&
+      b[8] == 0x57 && b[9] == 0x45 && b[10] == 0x42 && b[11] == 0x50;
+  return jpg || png || webp;
 }
 
 String _short(String u) => u.length > 70 ? '${u.substring(0, 70)}…' : u;
@@ -523,7 +576,7 @@ String folderNameFor(Movie m, String mode, String origStem) {
   String n;
   switch (mode) {
     case 'numTitle':
-      n = '${m.num} ${m.title}';
+      n = '${m.num} ${m.displayTitle}';
       break;
     case 'orig':
       n = origStem;
@@ -552,38 +605,41 @@ Future<File> moveFile(File f, String newPath) async {
 
 /// 把视频和它的同名附属文件（字幕、旧 NFO、海报等）移进 destDir，
 /// 返回视频的新路径。moves / newDirs 用来记录操作，供「撤销」使用
-Future<String> organizeInto(File video, String destDir,
+Future<String> organizeInto(Fs fs, String video, String destDir,
     {List? moves, List? newDirs}) async {
-  final srcDir = video.parent.path;
-  if (p.equals(srcDir, destDir)) return video.path;
-  final dir = Directory(destDir);
-  if (!dir.existsSync()) {
-    await dir.create(recursive: true);
+  final srcDir = p.dirname(video);
+  if (p.equals(srcDir, destDir)) return video;
+  if (!await fs.exists(destDir)) {
+    await fs.mkdirs(destDir);
     newDirs?.add(destDir);
   }
 
-  final stem = p.basenameWithoutExtension(video.path);
-  final entries = await Directory(srcDir).list().toList();
+  final stem = p.basenameWithoutExtension(video);
+  final entries = await fs.list(srcDir);
 
-  final moved = await moveFile(video, p.join(destDir, p.basename(video.path)));
-  moves?.add([video.path, moved.path]);
+  final newVideo = p.join(destDir, p.basename(video));
+  if (await fs.exists(newVideo)) {
+    throw '目标已存在同名文件：${p.basename(newVideo)}';
+  }
+  await fs.move(video, newVideo);
+  moves?.add([video, newVideo]);
 
   for (final e in entries) {
-    if (e is! File || p.equals(e.path, video.path)) continue;
-    final name = p.basename(e.path);
+    if (e.isDir || p.equals(e.path, video)) continue;
+    final name = e.name;
     final isSide = name.startsWith('$stem.') ||
         name == '$stem-poster.jpg' ||
         name == '$stem-fanart.jpg';
     if (!isSide) continue;
     if (!_sidecarExts.contains(p.extension(name).toLowerCase())) continue;
     final target = p.join(destDir, name);
-    if (File(target).existsSync()) continue;
+    if (await fs.exists(target)) continue;
     try {
-      final mf = await moveFile(e, target);
-      moves?.add([e.path, mf.path]);
+      await fs.move(e.path, target);
+      moves?.add([e.path, target]);
     } catch (_) {}
   }
-  return moved.path;
+  return newVideo;
 }
 
 // ═══════════════════════ 字幕 ═══════════════════════
@@ -591,14 +647,14 @@ Future<String> organizeInto(File video, String destDir,
 const _subExts = {'.srt', '.ass', '.ssa', '.vtt', '.sub'};
 
 /// 视频旁边是否已经有字幕文件
-bool hasSubtitle(String base) {
+Future<bool> hasSubtitle(Fs fs, String base) async {
   final stem = p.basename(base);
   try {
-    return Directory(p.dirname(base)).listSync().whereType<File>().any((f) {
-      final n = p.basename(f.path);
-      return n.startsWith('$stem.') &&
-          _subExts.contains(p.extension(n).toLowerCase());
-    });
+    final items = await fs.list(p.dirname(base));
+    return items.any((e) =>
+        !e.isDir &&
+        e.name.startsWith('$stem.') &&
+        _subExts.contains(p.extension(e.name).toLowerCase()));
   } catch (_) {
     return false;
   }
@@ -707,9 +763,9 @@ Future<void> saveJournal(List<Map<String, dynamic>> batches) async {
 
 /// 失败的文件（可以手动输入番号重试）
 class _Fail {
-  final File file;
+  final String path;
   final String reason;
-  _Fail(this.file, this.reason);
+  _Fail(this.path, this.reason);
 }
 
 // ═══════════════════════ 屏幕常亮（原生，由打包脚本注入） ═══════════════════════
@@ -720,6 +776,394 @@ Future<void> keepAwake(bool on) async {
   try {
     await _keepAwakeChannel.invokeMethod(on ? 'enable' : 'disable');
   } catch (_) {}
+}
+
+// ═══════════════════════ 文件系统（本机 / SMB 网络共享）═══════════════════════
+
+class FsItem {
+  final String path;
+  final bool isDir;
+  FsItem(this.path, this.isDir);
+  String get name => p.basename(path);
+}
+
+abstract class Fs {
+  Future<List<FsItem>> list(String dir);
+  Future<bool> exists(String path);
+  Future<void> mkdirs(String dir);
+  Future<void> writeBytes(String path, List<int> data);
+  Future<void> move(String from, String to);
+  Future<void> delete(String path);
+  Future<void> close();
+}
+
+class LocalFs implements Fs {
+  @override
+  Future<List<FsItem>> list(String dir) async {
+    final out = <FsItem>[];
+    await for (final e in Directory(dir).list(followLinks: false)) {
+      out.add(FsItem(e.path, e is Directory));
+    }
+    return out;
+  }
+
+  @override
+  Future<bool> exists(String path) async =>
+      await FileSystemEntity.type(path) != FileSystemEntityType.notFound;
+
+  @override
+  Future<void> mkdirs(String dir) async {
+    await Directory(dir).create(recursive: true);
+  }
+
+  @override
+  Future<void> writeBytes(String path, List<int> data) async {
+    await File(path).writeAsBytes(data);
+  }
+
+  @override
+  Future<void> move(String from, String to) async {
+    final f = File(from);
+    try {
+      await f.rename(to);
+    } catch (_) {
+      // 跨存储卡时 rename 会失败，改为复制后删除
+      await f.copy(to);
+      await f.delete();
+    }
+  }
+
+  @override
+  Future<void> delete(String path) async {
+    if (await FileSystemEntity.isDirectory(path)) {
+      await Directory(path).delete();
+    } else {
+      await File(path).delete();
+    }
+  }
+
+  @override
+  Future<void> close() async {}
+}
+
+/// SMB 网络共享（NAS、Windows 共享文件夹）。
+/// 路径格式：/共享名/文件夹/文件
+class SmbFs implements Fs {
+  final smb.SmbConnect c;
+  SmbFs(this.c);
+
+  String _n(String path) {
+    var t = path.replaceAll('\\', '/');
+    if (!t.startsWith('/')) t = '/$t';
+    while (t.length > 1 && t.endsWith('/')) {
+      t = t.substring(0, t.length - 1);
+    }
+    return t;
+  }
+
+  @override
+  Future<List<FsItem>> list(String dir) async {
+    final d = _n(dir);
+    if (d == '/') {
+      final shares = await c.listShares();
+      return shares.map((e) => FsItem(_n(e.path), true)).toList();
+    }
+    final folder = await c.file('$d/');
+    final files = await c.listFiles(folder);
+    return files.map((e) => FsItem(_n(e.path), e.isDirectory())).toList();
+  }
+
+  @override
+  Future<bool> exists(String path) async {
+    final n = _n(path);
+    try {
+      final f = await c.file(n);
+      if (f.isExists) return true;
+    } catch (_) {}
+    try {
+      final f = await c.file('$n/');
+      return f.isExists;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  @override
+  Future<void> mkdirs(String dir) async {
+    final parts = _n(dir).split('/').where((e) => e.isNotEmpty).toList();
+    var cur = '';
+    for (var i = 0; i < parts.length; i++) {
+      cur = '$cur/${parts[i]}';
+      if (i == 0) continue; // 第一段是共享名，不能创建
+      if (!await exists(cur)) {
+        await c.createFolder(cur);
+      }
+    }
+  }
+
+  @override
+  Future<void> writeBytes(String path, List<int> data) async {
+    final n = _n(path);
+    if (await exists(n)) {
+      final old = await c.file(n);
+      await c.delete(old);
+    }
+    final f = await c.createFile(n);
+    final w = await c.openWrite(f);
+    w.add(data);
+    await w.flush();
+    await w.close();
+  }
+
+  @override
+  Future<void> move(String from, String to) async {
+    final f = await c.file(_n(from));
+    await c.rename(f, _n(to));
+  }
+
+  @override
+  Future<void> delete(String path) async {
+    final n = _n(path);
+    final f = await c.file(n);
+    if (f.isExists) {
+      await c.delete(f);
+    } else {
+      final g = await c.file('$n/');
+      await c.delete(g);
+    }
+  }
+
+  @override
+  Future<void> close() async {
+    try {
+      await c.close();
+    } catch (_) {}
+  }
+}
+
+/// 递归扫描目录下所有视频，返回完整路径
+Future<List<String>> scanVideos(Fs fs, String root) async {
+  final out = <String>[];
+  final stack = <String>[root];
+  while (stack.isNotEmpty) {
+    final d = stack.removeLast();
+    try {
+      for (final e in await fs.list(d)) {
+        final name = e.name;
+        if (e.isDir) {
+          // 跳过群晖回收站、缩略图等系统目录
+          if (name.startsWith('@') || name.startsWith('#') || name.startsWith('.')) {
+            continue;
+          }
+          stack.add(e.path);
+        } else if (_videoExts.contains(p.extension(name).toLowerCase())) {
+          out.add(e.path);
+        }
+      }
+    } catch (_) {}
+  }
+  out.sort();
+  return out;
+}
+
+// ═══════════════════════ 剧照 ═══════════════════════
+
+Future<Uint8List?> _getImage(Net net, String url) async {
+  try {
+    final r = await net.get(url.replaceFirst(RegExp(r'^http://'), 'https://'));
+    final b = r.bodyBytes;
+    if (r.statusCode == 200 && b.length > 3000 && _isImage(b)) return b;
+  } catch (_) {}
+  return null;
+}
+
+/// 下载剧照到 dir（fanart1.jpg、fanart2.jpg…），返回成功张数。
+/// 3 张一组并行下载，写入时逐张进行（网络共享更稳）
+Future<int> downloadStills(Net net, Fs fs, List<String> urls, String dir,
+    int max, void Function(String) rec) async {
+  final list = (max > 0 && urls.length > max) ? urls.sublist(0, max) : urls;
+  if (list.isEmpty) return 0;
+  await fs.mkdirs(dir);
+  var ok = 0;
+  for (var i = 0; i < list.length; i += 3) {
+    final end = i + 3 > list.length ? list.length : i + 3;
+    final datas = await Future.wait([
+      for (var k = i; k < end; k++) _getImage(net, list[k]),
+    ]);
+    for (var k = i; k < end; k++) {
+      final b = datas[k - i];
+      if (b == null) continue;
+      final path = p.join(dir, 'fanart${k + 1}.jpg');
+      await fs.writeBytes(path, b);
+      rec(path);
+      ok++;
+    }
+  }
+  return ok;
+}
+
+// ═══════════════════════ 翻译 ═══════════════════════
+
+Future<String?> _googleTr(Net net, String text, String to, String from) async {
+  final url = 'https://translate.googleapis.com/translate_a/single'
+      '?client=gtx&sl=$from&tl=$to&dt=t&q=${Uri.encodeQueryComponent(text)}';
+  final r = await net.get(url);
+  if (r.statusCode != 200) throw 'HTTP ${r.statusCode}';
+  final j = jsonDecode(utf8.decode(r.bodyBytes)) as List;
+  final segs = j[0] as List;
+  return segs.map((e) => ((e as List)[0] ?? '').toString()).join();
+}
+
+Future<String?> _myMemoryTr(Net net, String text, String to) async {
+  final lp = Uri.encodeQueryComponent('ja|$to');
+  final r = await net.get('https://api.mymemory.translated.net/get'
+      '?q=${Uri.encodeQueryComponent(text)}&langpair=$lp');
+  if (r.statusCode != 200) throw 'HTTP ${r.statusCode}';
+  final j = jsonDecode(utf8.decode(r.bodyBytes)) as Map;
+  final t = (j['responseData'] as Map?)?['translatedText'];
+  return t?.toString();
+}
+
+/// 先用谷歌翻译，失败再用 MyMemory（只对日语原文有效）
+Future<String?> translateText(Net net, String text, String to,
+    {String from = 'auto',
+    bool fallback = true,
+    void Function(String)? log}) async {
+  try {
+    final t = await _googleTr(net, text, to, from);
+    if (t != null && t.trim().isNotEmpty) return t.trim();
+  } catch (e) {
+    log?.call('   · 谷歌翻译失败：${errText(e)}');
+  }
+  if (fallback && (from == 'ja' || from == 'auto')) {
+    try {
+      final t = await _myMemoryTr(net, text, to);
+      if (t != null &&
+          t.trim().isNotEmpty &&
+          !t.contains('MYMEMORY WARNING')) {
+        return t.trim();
+      }
+    } catch (e) {
+      log?.call('   · 备用翻译失败：${errText(e)}');
+    }
+  }
+  return null;
+}
+
+/// 批量翻译一组短词（类别），返回数量一致才算成功
+Future<List<String>?> translateList(Net net, List<String> items, String to,
+    {void Function(String)? log}) async {
+  final t = await translateText(net, items.join('\n'), to,
+      fallback: false, log: log);
+  if (t == null) return null;
+  final parts =
+      t.split('\n').map((e) => e.trim()).where((e) => e.isNotEmpty).toList();
+  if (parts.length != items.length) return null;
+  final out = <String>[];
+  for (final x in parts) {
+    if (!out.contains(x)) out.add(x);
+  }
+  return out;
+}
+
+// ═══════════════════════ 网络共享：选择文件夹 ═══════════════════════
+
+class RemoteDirPicker extends StatefulWidget {
+  final Fs fs;
+  final String initial;
+  const RemoteDirPicker({super.key, required this.fs, this.initial = '/'});
+
+  @override
+  State<RemoteDirPicker> createState() => _RemoteDirPickerState();
+}
+
+class _RemoteDirPickerState extends State<RemoteDirPicker> {
+  String cur = '/';
+  List<FsItem> dirs = [];
+  bool loading = true;
+  String? err;
+
+  @override
+  void initState() {
+    super.initState();
+    _load(widget.initial.isEmpty ? '/' : widget.initial, fallbackRoot: true);
+  }
+
+  Future<void> _load(String path, {bool fallbackRoot = false}) async {
+    if (mounted) {
+      setState(() {
+        loading = true;
+        err = null;
+      });
+    }
+    try {
+      final all = await widget.fs.list(path);
+      final d = all.where((e) => e.isDir && !e.name.endsWith('\$')).toList()
+        ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+      if (!mounted) return;
+      setState(() {
+        cur = path;
+        dirs = d;
+        loading = false;
+      });
+    } catch (e) {
+      if (fallbackRoot && path != '/') {
+        await _load('/');
+        return;
+      }
+      if (!mounted) return;
+      setState(() {
+        err = errText(e);
+        loading = false;
+      });
+    }
+  }
+
+  String _parent(String path) {
+    final pp = p.dirname(path);
+    return (pp == '.' || pp.isEmpty) ? '/' : pp;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text(cur == '/' ? '选择共享文件夹' : cur,
+          style: const TextStyle(fontSize: 15)),
+      content: SizedBox(
+        width: double.maxFinite,
+        height: 360,
+        child: loading
+            ? const Center(child: CircularProgressIndicator())
+            : err != null
+                ? Text('读取失败：$err')
+                : ListView(
+                    children: [
+                      if (cur != '/')
+                        ListTile(
+                          leading: const Icon(Icons.arrow_upward),
+                          title: const Text('上一级'),
+                          onTap: () => _load(_parent(cur)),
+                        ),
+                      for (final d in dirs)
+                        ListTile(
+                          leading: const Icon(Icons.folder),
+                          title: Text(d.name),
+                          onTap: () => _load(d.path),
+                        ),
+                      if (dirs.isEmpty) const ListTile(title: Text('（没有子文件夹）')),
+                    ],
+                  ),
+      ),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('取消')),
+        FilledButton(
+            onPressed: cur == '/' ? null : () => Navigator.pop(context, cur),
+            child: const Text('选择此文件夹')),
+      ],
+    );
+  }
 }
 
 // ═══════════════════════ NFO ═══════════════════════
@@ -735,7 +1179,7 @@ String buildNfo(Movie m, [List<String> extraTags = const []]) {
   final b = StringBuffer();
   b.writeln('<?xml version="1.0" encoding="utf-8" standalone="yes"?>');
   b.writeln('<movie>');
-  b.writeln('  <title>${_x('${m.num} ${m.title}')}</title>');
+  b.writeln('  <title>${_x('${m.num} ${m.displayTitle}')}</title>');
   b.writeln('  <originaltitle>${_x(m.title)}</originaltitle>');
   b.writeln('  <sorttitle>${_x(m.num)}</sorttitle>');
   b.writeln('  <num>${_x(m.num)}</num>');
@@ -786,6 +1230,10 @@ class _HomePageState extends State<HomePage> {
   final _javdbCtl = TextEditingController();
   final _proxyCtl = TextEditingController();
   final _subCtl = TextEditingController();
+  final _smbHostCtl = TextEditingController();
+  final _smbUserCtl = TextEditingController();
+  final _smbPassCtl = TextEditingController();
+  final _smbDomainCtl = TextEditingController();
   final _logs = <String>[];
   final _scroll = ScrollController();
   bool _running = false;
@@ -793,6 +1241,7 @@ class _HomePageState extends State<HomePage> {
   int _done = 0;
   int _total = 0;
   final _failed = <_Fail>[];
+  String _failKind = 'local';
   String _failReason = '';
   Map<String, dynamic>? _batch;
   int _undoCount = 0;
@@ -802,10 +1251,7 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
-    _javbusCtl.text = s.javbusUrl;
-    _javdbCtl.text = s.javdbUrl;
-    _proxyCtl.text = s.proxy;
-    _subCtl.text = s.subUrl;
+    _applyCtl();
     _loadCfg();
     _loadJournalInfo();
   }
@@ -816,8 +1262,23 @@ class _HomePageState extends State<HomePage> {
     _javdbCtl.dispose();
     _proxyCtl.dispose();
     _subCtl.dispose();
+    _smbHostCtl.dispose();
+    _smbUserCtl.dispose();
+    _smbPassCtl.dispose();
+    _smbDomainCtl.dispose();
     _scroll.dispose();
     super.dispose();
+  }
+
+  void _applyCtl() {
+    _javbusCtl.text = s.javbusUrl;
+    _javdbCtl.text = s.javdbUrl;
+    _proxyCtl.text = s.proxy;
+    _subCtl.text = s.subUrl;
+    _smbHostCtl.text = s.smbHost;
+    _smbUserCtl.text = s.smbUser;
+    _smbPassCtl.text = s.smbPass;
+    _smbDomainCtl.text = s.smbDomain;
   }
 
   Future<void> _loadCfg() async {
@@ -829,10 +1290,7 @@ class _HomePageState extends State<HomePage> {
       setState(() {
         s.load(j);
         themeNotifier.value = themeFromString(s.themeMode);
-        _javbusCtl.text = s.javbusUrl;
-        _javdbCtl.text = s.javdbUrl;
-        _proxyCtl.text = s.proxy;
-        _subCtl.text = s.subUrl;
+        _applyCtl();
       });
     } catch (_) {}
   }
@@ -842,6 +1300,10 @@ class _HomePageState extends State<HomePage> {
     s.javdbUrl = _javdbCtl.text.trim();
     s.proxy = _proxyCtl.text.trim();
     s.subUrl = _subCtl.text.trim();
+    s.smbHost = _smbHostCtl.text.trim();
+    s.smbUser = _smbUserCtl.text.trim();
+    s.smbPass = _smbPassCtl.text;
+    s.smbDomain = _smbDomainCtl.text.trim();
   }
 
   Future<void> _saveCfg() async {
@@ -882,14 +1344,27 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  /// kind: local=本机存储  smb=网络共享
+  Future<Fs> _openFs(String kind) async {
+    if (kind != 'smb') return LocalFs();
+    final c = await smb.SmbConnect.connectAuth(
+      host: s.smbHost,
+      domain: s.smbDomain,
+      username: s.smbUser,
+      password: s.smbPass,
+    ).timeout(const Duration(seconds: 20));
+    return SmbFs(c);
+  }
+
   Future<void> _loadJournalInfo() async {
     final all = await loadJournal();
     if (mounted) setState(() => _undoCount = all.length);
   }
 
-  Map<String, dynamic> _newBatch(String label) => {
+  Map<String, dynamic> _newBatch(String label, String kind) => {
         'id': DateTime.now().toIso8601String(),
         'label': label,
+        'fs': kind,
         'moves': [],
         'created': [],
         'dirs': [],
@@ -913,14 +1388,28 @@ class _HomePageState extends State<HomePage> {
     if (mounted) setState(() => _undoCount = all.length);
   }
 
-  /// 返回 0=成功 1=跳过 2=失败
-  Future<int> _processOne(Net net, File file,
-      {String? forceNum, bool dry = false}) async {
-    final name = p.basename(file.path);
-    final stem = p.basenameWithoutExtension(file.path);
-    var base = p.withoutExtension(file.path);
+  Future<void> _translateMovie(Net net, Movie m) async {
+    if (m.translated) return;
+    m.translated = true;
+    if (m.title.isNotEmpty) {
+      final t = await translateText(net, m.title, s.trLang,
+          from: 'ja', log: _log);
+      if (t != null) m.titleZh = t;
+    }
+    if (m.genres.isNotEmpty) {
+      final g = await translateList(net, m.genres, s.trLang, log: _log);
+      if (g != null) m.genres = g;
+    }
+  }
 
-    if (s.skipExisting && File('$base.nfo').existsSync()) {
+  /// 返回 0=成功 1=跳过 2=失败
+  Future<int> _processOne(Net net, Fs fs, String vpath,
+      {String? forceNum, bool dry = false}) async {
+    final name = p.basename(vpath);
+    final stem = p.basenameWithoutExtension(vpath);
+    var base = p.withoutExtension(vpath);
+
+    if (s.skipExisting && await fs.exists('$base.nfo')) {
       _log('⏭ 已有 NFO，跳过：$name');
       return 1;
     }
@@ -957,20 +1446,23 @@ class _HomePageState extends State<HomePage> {
     }
     final tags = codeTags(name);
 
+    if (s.translate) await _translateMovie(net, m);
+
     // 试运行：只预览，不改动任何文件
     if (dry) {
       final folder = folderNameFor(m, s.folderMode, stem);
       final where = !s.organize
           ? '不整理'
-          : (p.basename(file.parent.path) == folder
+          : (p.basename(p.dirname(vpath)) == folder
               ? '已在正确的文件夹里'
               : '将移动到 $folder/');
       final will = [
         'NFO',
         if (s.downloadCover) '封面',
+        if (s.downloadStills) '剧照(${m.stills.length})',
         if (s.downloadSub) '字幕',
       ].join('+');
-      _log('📋 ${m.title}\n   来源：${m.sources.join(' + ')}\n'
+      _log('📋 ${m.displayTitle}\n   来源：${m.sources.join(' + ')}\n'
           '   $where；将生成：$will');
       return 0;
     }
@@ -978,11 +1470,11 @@ class _HomePageState extends State<HomePage> {
     // 整理：新建文件夹，把视频和同名附属文件移进去
     var organized = '';
     if (s.organize) {
-      var destDir = file.parent.path;
+      var destDir = p.dirname(vpath);
       final folder = folderNameFor(m, s.folderMode, stem);
       if (p.basename(destDir) != folder) destDir = p.join(destDir, folder);
       try {
-        final moved = await organizeInto(file, destDir,
+        final moved = await organizeInto(fs, vpath, destDir,
             moves: _batch?['moves'] as List?,
             newDirs: _batch?['dirs'] as List?);
         base = p.withoutExtension(moved);
@@ -1007,25 +1499,52 @@ class _HomePageState extends State<HomePage> {
       }
       if (bytes != null) {
         final poster = await compute(makePoster, bytes);
-        await File('$base-poster.jpg').writeAsBytes(poster ?? bytes);
-        await File('$base-fanart.jpg').writeAsBytes(bytes);
+        await fs.writeBytes('$base-poster.jpg', poster ?? bytes);
+        await fs.writeBytes('$base-fanart.jpg', bytes);
         _rec('$base-poster.jpg');
         _rec('$base-fanart.jpg');
         coverOk = true;
       }
     }
-    await File('$base.nfo').writeAsString(buildNfo(m, tags));
+
+    var stillsNote = '';
+    if (s.downloadStills) {
+      if (m.stills.isEmpty) {
+        stillsNote = '剧照：无';
+      } else {
+        try {
+          final parent = p.dirname(base);
+          final own =
+              organized.isNotEmpty || p.basename(parent) == folderNameFor(m, s.folderMode, stem);
+          final dir = own
+              ? p.join(parent, 'extrafanart')
+              : p.join(parent, '$stem-extrafanart');
+          final existed = await fs.exists(dir);
+          final n = await downloadStills(
+              net, fs, m.stills, dir, s.stillsMax, _rec);
+          if (!existed && n > 0) {
+            (_batch?['dirs'] as List?)?.add(dir);
+          }
+          stillsNote = '剧照：$n 张';
+        } catch (e) {
+          _log('   · 剧照失败：${errText(e)}');
+          stillsNote = '剧照：✗';
+        }
+      }
+    }
+
+    await fs.writeBytes('$base.nfo', utf8.encode(buildNfo(m, tags)));
     _rec('$base.nfo');
 
     var subNote = '';
     if (s.downloadSub) {
-      if (hasSubtitle(base)) {
+      if (await hasSubtitle(fs, base)) {
         subNote = '字幕：已有';
       } else {
         try {
           final sub = await fetchSubtitle(net, s.subUrl, num, _log);
           if (sub != null) {
-            await File('$base.${sub.$2}.srt').writeAsBytes(sub.$1);
+            await fs.writeBytes('$base.${sub.$2}.srt', sub.$1);
             _rec('$base.${sub.$2}.srt');
             subNote = '字幕：✓';
           } else {
@@ -1041,19 +1560,24 @@ class _HomePageState extends State<HomePage> {
     final tail = [
       '来源：${m.sources.join(' + ')}',
       '封面：${s.downloadCover ? (coverOk ? '✓' : '✗') : '未开启'}',
+      if (stillsNote.isNotEmpty) stillsNote,
+      if (s.translate) '翻译：${m.titleZh.isNotEmpty ? '✓' : '✗'}',
       if (organized.isNotEmpty) '📁 $organized/',
       if (subNote.isNotEmpty) subNote,
       if (tags.isNotEmpty) '🏷 ${tags.join('/')}',
     ].join('   ');
-    _log('✅ ${m.title}\n   $tail');
+    final orig = (m.titleZh.isNotEmpty && m.titleZh != m.title)
+        ? '\n   原题：${m.title}'
+        : '';
+    _log('✅ ${m.displayTitle}$orig\n   $tail');
     return 0;
   }
 
   /// 只下载字幕（不刮削、不移动文件）。返回 0=成功 1=跳过 2=失败
-  Future<int> _subOne(Net net, File file) async {
-    final name = p.basename(file.path);
-    final base = p.withoutExtension(file.path);
-    if (hasSubtitle(base)) {
+  Future<int> _subOne(Net net, Fs fs, String vpath) async {
+    final name = p.basename(vpath);
+    final base = p.withoutExtension(vpath);
+    if (await hasSubtitle(fs, base)) {
       _log('⏭ 已有字幕，跳过：$name');
       return 1;
     }
@@ -1072,7 +1596,7 @@ class _HomePageState extends State<HomePage> {
         return 2;
       }
       final out = '$base.${sub.$2}.srt';
-      await File(out).writeAsBytes(sub.$1);
+      await fs.writeBytes(out, sub.$1);
       _log('✅ 字幕已保存：${p.basename(out)}');
       return 0;
     } catch (e) {
@@ -1084,16 +1608,15 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _start({bool subsOnly = false, bool dry = false}) async {
     if (_running) return;
-    if (!await _ensurePermission()) {
+    _syncCfg();
+    final kind = s.source;
+    final granted = await _ensurePermission();
+    if (kind == 'local' && !granted) {
       _log('❌ 没有获得「所有文件访问权限」。请在系统设置里给本应用开启后重试。');
       return;
     }
-    final dir = await FilePicker.platform
-        .getDirectoryPath(dialogTitle: '选择存放视频的文件夹');
-    if (dir == null) return;
-
-    _syncCfg();
     await _saveCfg();
+
     setState(() {
       _running = true;
       _cancel = false;
@@ -1102,37 +1625,68 @@ class _HomePageState extends State<HomePage> {
       _logs.clear();
       _failed.clear();
     });
+    _log('影片刮削器 v$appVersion');
+
+    Fs? fs;
+    String? dir;
+    try {
+      if (kind == 'smb') {
+        if (s.smbHost.isEmpty) {
+          _log('❌ 请先在设置里填写 SMB 服务器地址、用户名和密码');
+        } else {
+          _log('🔌 正在连接 ${s.smbHost} …');
+          final conn = await _openFs('smb');
+          fs = conn;
+          if (mounted) {
+            dir = await showDialog<String>(
+              context: context,
+              barrierDismissible: false,
+              builder: (_) => RemoteDirPicker(fs: conn, initial: s.smbPath),
+            );
+          }
+          if (dir != null) {
+            s.smbPath = dir;
+            await _saveCfg();
+          }
+        }
+      } else {
+        fs = LocalFs();
+        dir = await FilePicker.platform
+            .getDirectoryPath(dialogTitle: '选择存放视频的文件夹');
+      }
+    } catch (e) {
+      _log('❌ ${kind == 'smb' ? '连接失败' : '出错'}：${errText(e)}');
+      dir = null;
+    }
+    if (dir == null || fs == null) {
+      await fs?.close();
+      if (mounted) setState(() => _running = false);
+      return;
+    }
+    final Fs fsys = fs;
+    final String root = dir;
+
+    _failKind = kind;
     _cache.clear();
     _coverCache.clear();
     _batch = (subsOnly || dry)
         ? null
         : _newBatch(
-            '${DateTime.now().toString().substring(0, 16)}  ${p.basename(dir)}');
+            '${DateTime.now().toString().substring(0, 16)}  ${p.basename(root)}',
+            kind);
 
-    _log('影片刮削器 v$appVersion');
-    _log('📂 扫描：$dir'
+    _log('📂 扫描：$root'
         '${subsOnly ? '（只下载字幕）' : dry ? '（试运行，不会改动任何文件）' : ''}');
     if (s.keepAwake) keepAwake(true);
 
-    final files = <File>[];
-    try {
-      await for (final e in Directory(dir).list(recursive: true)) {
-        if (e is File &&
-            _videoExts.contains(p.extension(e.path).toLowerCase())) {
-          files.add(e);
-        }
-      }
-    } catch (e) {
-      _log('⚠️ 扫描时出错（部分目录可能无法访问）：$e');
-    }
-    files.sort((a, b) => a.path.compareTo(b.path));
-    setState(() => _total = files.length);
+    final files = await scanVideos(fsys, root);
+    if (mounted) setState(() => _total = files.length);
     _log('找到 ${files.length} 个视频文件');
 
     final net = Net(s.proxy);
     var ok = 0, skip = 0, fail = 0;
     try {
-      for (final file in files) {
+      for (final path in files) {
         if (_cancel) {
           _log('⏹ 已停止');
           break;
@@ -1141,8 +1695,8 @@ class _HomePageState extends State<HomePage> {
         _failReason = '';
         try {
           code = subsOnly
-              ? await _subOne(net, file)
-              : await _processOne(net, file, dry: dry);
+              ? await _subOne(net, fsys, path)
+              : await _processOne(net, fsys, path, dry: dry);
         } catch (e) {
           _failReason = errText(e);
           _log('❌ 出错：$_failReason');
@@ -1152,7 +1706,7 @@ class _HomePageState extends State<HomePage> {
         if (code == 2) {
           fail++;
           if (!subsOnly && !dry) {
-            _failed.add(_Fail(file, _failReason.isEmpty ? '失败' : _failReason));
+            _failed.add(_Fail(path, _failReason.isEmpty ? '失败' : _failReason));
           }
         }
         if (_batch != null && code == 0) await _commitBatch();
@@ -1162,6 +1716,7 @@ class _HomePageState extends State<HomePage> {
     } finally {
       net.close();
       keepAwake(false);
+      await fsys.close();
     }
     await _commitBatch();
     _batch = null;
@@ -1171,7 +1726,7 @@ class _HomePageState extends State<HomePage> {
     if (mounted) setState(() => _running = false);
   }
 
-  /// 撤销上一次整理：文件移回原位，删除那次生成的 NFO/封面/字幕
+  /// 撤销上一次整理：文件移回原位，删除那次生成的 NFO/封面/剧照/字幕
   Future<void> _undoLast() async {
     if (_running) return;
     final all = await loadJournal();
@@ -1181,6 +1736,7 @@ class _HomePageState extends State<HomePage> {
       return;
     }
     final b = all.last;
+    final kind = (b['fs'] as String?) ?? 'local';
     final moves = (b['moves'] as List)
         .map((e) => (e as List).cast<String>())
         .toList();
@@ -1191,9 +1747,10 @@ class _HomePageState extends State<HomePage> {
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('撤销上次整理？'),
-        content: Text('${b['label']}\n\n'
+        content: Text('${b['label']}'
+            '${kind == 'smb' ? '（网络共享）' : ''}\n\n'
             '将把 ${moves.length} 个文件移回原来的位置，'
-            '并删除这次生成的 ${created.length} 个 NFO / 封面 / 字幕文件。'),
+            '并删除这次生成的 ${created.length} 个 NFO / 封面 / 剧照 / 字幕文件。'),
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(ctx, false),
@@ -1206,45 +1763,51 @@ class _HomePageState extends State<HomePage> {
     );
     if (yes != true) return;
 
+    _syncCfg();
     setState(() => _running = true);
     _log('↩ 开始撤销：${b['label']}');
-    for (final c in created) {
-      try {
-        final f = File(c);
-        if (f.existsSync()) await f.delete();
-      } catch (_) {}
-    }
-    var back = 0, miss = 0;
-    for (final mv in moves.reversed) {
-      final from = mv[0], to = mv[1];
-      try {
-        if (!File(to).existsSync() || File(from).existsSync()) {
-          miss++;
-          continue;
-        }
-        await Directory(p.dirname(from)).create(recursive: true);
-        await moveFile(File(to), from);
-        back++;
-      } catch (e) {
-        miss++;
-        _log('   ⚠️ ${p.basename(to)} 无法移回：${errText(e)}');
+    Fs? fs;
+    try {
+      fs = await _openFs(kind);
+      final f = fs;
+      for (final c in created) {
+        try {
+          if (await f.exists(c)) await f.delete(c);
+        } catch (_) {}
       }
-    }
-    for (final d in dirs.reversed) {
-      try {
-        final dir = Directory(d);
-        if (dir.existsSync() && dir.listSync().isEmpty) await dir.delete();
-      } catch (_) {}
-    }
-    all.removeLast();
-    await saveJournal(all);
-    _log('↩ 已撤销：移回 $back 个文件'
-        '${miss > 0 ? '，$miss 个没法移回（已不在原处，或原位置已有同名文件）' : ''}');
-    if (mounted) {
-      setState(() {
-        _undoCount = all.length;
-        _running = false;
-      });
+      var back = 0, miss = 0;
+      for (final mv in moves.reversed) {
+        final from = mv[0], to = mv[1];
+        try {
+          if (!await f.exists(to) || await f.exists(from)) {
+            miss++;
+            continue;
+          }
+          await f.mkdirs(p.dirname(from));
+          await f.move(to, from);
+          back++;
+        } catch (e) {
+          miss++;
+          _log('   ⚠️ ${p.basename(to)} 无法移回：${errText(e)}');
+        }
+      }
+      for (final d in dirs.reversed) {
+        try {
+          if (await f.exists(d) && (await f.list(d)).isEmpty) {
+            await f.delete(d);
+          }
+        } catch (_) {}
+      }
+      all.removeLast();
+      await saveJournal(all);
+      _log('↩ 已撤销：移回 $back 个文件'
+          '${miss > 0 ? '，$miss 个没法移回（已不在原处，或原位置已有同名文件）' : ''}');
+      if (mounted) setState(() => _undoCount = all.length);
+    } catch (e) {
+      _log('❌ 撤销失败：${errText(e)}');
+    } finally {
+      await fs?.close();
+      if (mounted) setState(() => _running = false);
     }
   }
 
@@ -1258,15 +1821,18 @@ class _HomePageState extends State<HomePage> {
       _running = true;
       _cancel = false;
     });
-    _batch = _newBatch('手动处理 ${p.basename(f.file.path)}');
+    _batch = _newBatch('手动处理 ${p.basename(f.path)}', _failKind);
+    Fs? fs;
     final net = Net(s.proxy);
     var code = 2;
     try {
-      code = await _processOne(net, f.file, forceNum: num);
+      fs = await _openFs(_failKind);
+      code = await _processOne(net, fs, f.path, forceNum: num);
     } catch (e) {
       _log('❌ 出错：${errText(e)}');
     } finally {
       net.close();
+      await fs?.close();
     }
     await _commitBatch();
     _batch = null;
@@ -1279,8 +1845,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<String?> _askNum(BuildContext ctx, _Fail f) {
-    final c = TextEditingController(
-        text: extractCode(p.basename(f.file.path)) ?? '');
+    final c = TextEditingController(text: extractCode(p.basename(f.path)) ?? '');
     return showDialog<String>(
       context: ctx,
       builder: (dctx) => AlertDialog(
@@ -1317,7 +1882,7 @@ class _HomePageState extends State<HomePage> {
             const ListTile(title: Text('点一下文件，手动输入番号后重试')),
             for (final f in _failed)
               ListTile(
-                title: Text(p.basename(f.file.path),
+                title: Text(p.basename(f.path),
                     maxLines: 2, overflow: TextOverflow.ellipsis),
                 subtitle: Text(f.reason),
                 trailing: const Icon(Icons.edit),
@@ -1334,6 +1899,25 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  Widget _title(String t) => Padding(
+        padding: const EdgeInsets.only(top: 16, bottom: 6),
+        child: Text(t, style: const TextStyle(fontWeight: FontWeight.bold)),
+      );
+
+  Widget _field(TextEditingController c, String label, {bool secret = false}) =>
+      Padding(
+        padding: const EdgeInsets.only(bottom: 10),
+        child: TextField(
+          controller: c,
+          obscureText: secret,
+          decoration: InputDecoration(
+            labelText: label,
+            border: const OutlineInputBorder(),
+            isDense: true,
+          ),
+        ),
+      );
+
   void _openSettings() {
     showModalBottomSheet(
       context: context,
@@ -1343,7 +1927,7 @@ class _HomePageState extends State<HomePage> {
           padding: EdgeInsets.only(
             left: 16,
             right: 16,
-            top: 16,
+            top: 8,
             bottom: MediaQuery.of(ctx).viewInsets.bottom + 16,
           ),
           child: SingleChildScrollView(
@@ -1351,9 +1935,7 @@ class _HomePageState extends State<HomePage> {
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text('外观',
-                    style: TextStyle(fontWeight: FontWeight.bold)),
-                const SizedBox(height: 8),
+                _title('外观'),
                 SegmentedButton<ThemeMode>(
                   showSelectedIcon: false,
                   segments: const [
@@ -1372,10 +1954,7 @@ class _HomePageState extends State<HomePage> {
                     _saveCfg();
                   },
                 ),
-                const SizedBox(height: 16),
-                const Text('刮削源（可多选，结果会合并）',
-                    style: TextStyle(fontWeight: FontWeight.bold)),
-                const SizedBox(height: 8),
+                _title('刮削源（可多选，结果会合并）'),
                 Wrap(
                   spacing: 8,
                   children: [
@@ -1397,35 +1976,21 @@ class _HomePageState extends State<HomePage> {
                   ],
                 ),
                 const SizedBox(height: 12),
-                TextField(
-                  controller: _javbusCtl,
-                  decoration: const InputDecoration(
-                    labelText: 'JavBus 网址（可换镜像）',
-                    border: OutlineInputBorder(),
-                    isDense: true,
-                  ),
+                _field(_javbusCtl, 'JavBus 网址（可换镜像）'),
+                _field(_javdbCtl, 'JavDB 网址'),
+                _field(_proxyCtl, 'HTTP 代理（可留空），如 127.0.0.1:7890'),
+                _title('网络共享（SMB）：NAS / 电脑共享文件夹'),
+                const Text(
+                  '在主界面选择「网络共享」后，就能直接刮削 NAS 或电脑共享出来的视频。'
+                  '支持 SMB1 / SMB2.0 / SMB2.1。',
+                  style: TextStyle(fontSize: 12),
                 ),
-                const SizedBox(height: 10),
-                TextField(
-                  controller: _javdbCtl,
-                  decoration: const InputDecoration(
-                    labelText: 'JavDB 网址',
-                    border: OutlineInputBorder(),
-                    isDense: true,
-                  ),
-                ),
-                const SizedBox(height: 10),
-                TextField(
-                  controller: _proxyCtl,
-                  decoration: const InputDecoration(
-                    labelText: 'HTTP 代理（可留空），如 127.0.0.1:7890',
-                    border: OutlineInputBorder(),
-                    isDense: true,
-                  ),
-                ),
-                const SizedBox(height: 16),
-                const Text('整理',
-                    style: TextStyle(fontWeight: FontWeight.bold)),
+                const SizedBox(height: 8),
+                _field(_smbHostCtl, '服务器地址，如 192.168.1.100'),
+                _field(_smbUserCtl, '用户名（匿名共享可填 guest）'),
+                _field(_smbPassCtl, '密码', secret: true),
+                _field(_smbDomainCtl, '域 / 工作组（一般留空）'),
+                _title('整理'),
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
                   title: const Text('刮削成功后整理到文件夹'),
@@ -1463,34 +2028,69 @@ class _HomePageState extends State<HomePage> {
                 ),
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
+                  title: const Text('处理时保持屏幕常亮'),
+                  subtitle: const Text('批量处理时防止息屏后被系统中断'),
+                  value: s.keepAwake,
+                  onChanged: (v) => setM(() => s.keepAwake = v),
+                ),
+                _title('图片'),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
                   title: const Text('下载封面'),
                   value: s.downloadCover,
                   onChanged: (v) => setM(() => s.downloadCover = v),
                 ),
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
-                  title: const Text('处理时保持屏幕常亮'),
-                  subtitle: const Text('批量处理时防止息屏后被系统中断'),
-                  value: s.keepAwake,
-                  onChanged: (v) => setM(() => s.keepAwake = v),
+                  title: const Text('下载剧照'),
+                  subtitle: const Text('保存到 extrafanart 文件夹，Emby / Kodi 可当背景'),
+                  value: s.downloadStills,
+                  onChanged: (v) => setM(() => s.downloadStills = v),
                 ),
-                const SizedBox(height: 8),
-                const Text('字幕（实验性）',
-                    style: TextStyle(fontWeight: FontWeight.bold)),
+                if (s.downloadStills)
+                  Wrap(
+                    spacing: 8,
+                    children: [
+                      for (final n in const [5, 10, 20, 0])
+                        ChoiceChip(
+                          label: Text(n == 0 ? '全部' : '最多 $n 张'),
+                          selected: s.stillsMax == n,
+                          onSelected: (_) => setM(() => s.stillsMax = n),
+                        ),
+                    ],
+                  ),
+                _title('翻译'),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('翻译标题和类别'),
+                  subtitle: const Text('原标题保留在 NFO 的 originaltitle 里；需要能访问谷歌翻译，可配合代理'),
+                  value: s.translate,
+                  onChanged: (v) => setM(() => s.translate = v),
+                ),
+                if (s.translate)
+                  Wrap(
+                    spacing: 8,
+                    children: [
+                      for (final l in const [
+                        ['zh-CN', '简体中文'],
+                        ['zh-TW', '繁體中文'],
+                        ['en', 'English'],
+                      ])
+                        ChoiceChip(
+                          label: Text(l[1]),
+                          selected: s.trLang == l[0],
+                          onSelected: (_) => setM(() => s.trLang = l[0]),
+                        ),
+                    ],
+                  ),
+                _title('字幕（实验性）'),
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
                   title: const Text('刮削时自动下载中文字幕'),
                   value: s.downloadSub,
                   onChanged: (v) => setM(() => s.downloadSub = v),
                 ),
-                TextField(
-                  controller: _subCtl,
-                  decoration: const InputDecoration(
-                    labelText: '字幕站网址',
-                    border: OutlineInputBorder(),
-                    isDense: true,
-                  ),
-                ),
+                _field(_subCtl, '字幕站网址'),
               ],
             ),
           ),
@@ -1534,6 +2134,32 @@ class _HomePageState extends State<HomePage> {
         padding: const EdgeInsets.all(12),
         child: Column(
           children: [
+            SizedBox(
+              width: double.infinity,
+              child: SegmentedButton<String>(
+                showSelectedIcon: false,
+                segments: const [
+                  ButtonSegment(
+                    value: 'local',
+                    label: Text('本机存储'),
+                    icon: Icon(Icons.phone_android),
+                  ),
+                  ButtonSegment(
+                    value: 'smb',
+                    label: Text('网络共享'),
+                    icon: Icon(Icons.dns),
+                  ),
+                ],
+                selected: {s.source},
+                onSelectionChanged: _running
+                    ? null
+                    : (v) {
+                        setState(() => s.source = v.first);
+                        _saveCfg();
+                      },
+              ),
+            ),
+            const SizedBox(height: 8),
             Row(
               children: [
                 Expanded(
