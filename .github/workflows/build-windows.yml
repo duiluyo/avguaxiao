@@ -8,6 +8,7 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+
     steps:
       - name: 拉取代码
         uses: actions/checkout@v4
@@ -25,21 +26,42 @@ jobs:
             flutter create --platforms=windows --project-name video_scraper .
           fi
 
-      - name: 窗口标题改成「影片刮削器」
-        shell: bash
+      - name: 窗口标题改成影片刮削器
+        shell: pwsh
         run: |
-          python - <<'EOF'
-          path = 'windows/runner/main.cpp'
-          s = open(path, encoding='utf-8').read()
-          title = '影片刮削器'
-          esc = ''.join('\\u%04X' % ord(c) for c in title)
-          if 'L"video_scraper"' in s:
-              s = s.replace('L"video_scraper"', 'L"' + esc + '"')
-              open(path, 'w', encoding='utf-8').write(s)
-              print('窗口标题已修改')
-          else:
-              print('::warning::没找到窗口标题，保持默认')
-          EOF
+          $path = "windows/runner/main.cpp"
+
+          if (-not (Test-Path $path)) {
+            Write-Error "找不到 $path"
+            exit 1
+          }
+
+          $content = [System.IO.File]::ReadAllText(
+            (Resolve-Path $path),
+            [System.Text.Encoding]::UTF8
+          )
+
+          $oldTitle = 'L"video_scraper"'
+          $newTitle = 'L"\u5F71\u7247\u522E\u524A\u5668"'
+
+          if ($content.Contains($oldTitle)) {
+            $content = $content.Replace($oldTitle, $newTitle)
+
+            [System.IO.File]::WriteAllText(
+              (Resolve-Path $path),
+              $content,
+              [System.Text.UTF8Encoding]::new($false)
+            )
+
+            Write-Host "窗口标题已修改"
+          }
+          elseif ($content.Contains($newTitle)) {
+            Write-Host "窗口标题已经是影片刮削器，无需修改"
+          }
+          else {
+            Write-Error "没有找到预期的窗口标题，请检查 main.cpp"
+            exit 1
+          }
 
       - name: 安装依赖
         run: flutter pub get
@@ -51,13 +73,20 @@ jobs:
         shell: pwsh
         run: |
           $dst = "build/windows/x64/runner/Release"
+
           foreach ($f in "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll") {
-            Copy-Item "C:\Windows\System32\$f" $dst -ErrorAction SilentlyContinue
+            $src = "C:\Windows\System32\$f"
+
+            if (Test-Path $src) {
+              Copy-Item $src $dst -Force
+            }
           }
+
           Get-ChildItem $dst | Select-Object Name, Length
 
       - name: 上传 Windows 程序
         uses: actions/upload-artifact@v4
         with:
           name: video-scraper-windows
-          path: build/windows/x64/runner/Release
+          path: build/windows/x64/runner/Release/
+          if-no-files-found: error
