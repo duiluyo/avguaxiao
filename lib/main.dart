@@ -17,7 +17,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:smb_connect/smb_connect.dart' as smb;
 
 /// 每次修改代码都要同步修改这里和 pubspec.yaml 里的 version
-const appVersion = '1.4.0';
+const appVersion = '1.4.1';
 
 void main() => runApp(const ScraperApp());
 
@@ -1247,6 +1247,10 @@ class _HomePageState extends State<HomePage> {
   int _undoCount = 0;
   final _cache = <String, Movie>{};
   final _coverCache = <String, Uint8List>{};
+  String? _selDir; // 已选择的影片文件夹
+  String _selKind = 'local';
+  List<String> _files = []; // 已选文件夹里的视频
+  bool _scanning = false;
 
   @override
   void initState() {
@@ -1606,8 +1610,9 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  Future<void> _start({bool subsOnly = false, bool dry = false}) async {
-    if (_running) return;
+  /// 第一步：选择影片文件夹，并扫描里面的视频
+  Future<void> _pickFolder() async {
+    if (_running || _scanning) return;
     _syncCfg();
     final kind = s.source;
     final granted = await _ensurePermission();
@@ -1616,19 +1621,11 @@ class _HomePageState extends State<HomePage> {
       return;
     }
     await _saveCfg();
-
-    setState(() {
-      _running = true;
-      _cancel = false;
-      _done = 0;
-      _total = 0;
-      _logs.clear();
-      _failed.clear();
-    });
-    _log('影片刮削器 v$appVersion');
+    setState(() => _scanning = true);
 
     Fs? fs;
     String? dir;
+    var files = <String>[];
     try {
       if (kind == 'smb') {
         if (s.smbHost.isEmpty) {
@@ -1652,19 +1649,84 @@ class _HomePageState extends State<HomePage> {
       } else {
         fs = LocalFs();
         dir = await FilePicker.platform
-            .getDirectoryPath(dialogTitle: '选择存放视频的文件夹');
+            .getDirectoryPath(dialogTitle: '选择存放影片的文件夹');
+      }
+      if (dir != null && fs != null) {
+        if (mounted) setState(() => _logs.clear());
+        _log('📂 正在扫描：$dir');
+        files = await scanVideos(fs, dir);
       }
     } catch (e) {
       _log('❌ ${kind == 'smb' ? '连接失败' : '出错'}：${errText(e)}');
       dir = null;
-    }
-    if (dir == null || fs == null) {
+    } finally {
       await fs?.close();
+    }
+    if (!mounted) return;
+    setState(() {
+      _scanning = false;
+      if (dir != null) {
+        _selDir = dir;
+        _selKind = kind;
+        _files = files;
+        _failed.clear();
+        _done = 0;
+        _total = 0;
+      }
+    });
+    if (dir != null) {
+      _log(files.isEmpty
+          ? '已选择：$dir\n这个文件夹里没有找到视频文件'
+          : '已选择：$dir\n找到 ${files.length} 个视频文件，请在下方选择要执行的操作');
+    }
+  }
+
+  /// 重新扫描已选文件夹（文件被整理或移动后，列表会随之更新）
+  Future<void> _rescan() async {
+    final root = _selDir;
+    if (root == null || _running || _scanning) return;
+    _syncCfg();
+    setState(() => _scanning = true);
+    Fs? fs;
+    try {
+      fs = await _openFs(_selKind);
+      final fresh = await scanVideos(fs, root);
+      if (mounted) setState(() => _files = fresh);
+    } catch (e) {
+      _log('❌ 重新扫描失败：${errText(e)}');
+    } finally {
+      await fs?.close();
+      if (mounted) setState(() => _scanning = false);
+    }
+  }
+
+  /// 第二步：对已选择的文件夹执行操作（刮削 / 试运行 / 只下载字幕）
+  Future<void> _run({bool subsOnly = false, bool dry = false}) async {
+    final root = _selDir;
+    if (_running || _scanning || root == null) return;
+    _syncCfg();
+    final kind = _selKind;
+    await _saveCfg();
+
+    setState(() {
+      _running = true;
+      _cancel = false;
+      _done = 0;
+      _total = 0;
+      _logs.clear();
+      _failed.clear();
+    });
+    _log('影片刮削器 v$appVersion');
+
+    final Fs fsys;
+    try {
+      if (kind == 'smb') _log('🔌 正在连接 ${s.smbHost} …');
+      fsys = await _openFs(kind);
+    } catch (e) {
+      _log('❌ 连接失败：${errText(e)}');
       if (mounted) setState(() => _running = false);
       return;
     }
-    final Fs fsys = fs;
-    final String root = dir;
 
     _failKind = kind;
     _cache.clear();
@@ -1675,13 +1737,13 @@ class _HomePageState extends State<HomePage> {
             '${DateTime.now().toString().substring(0, 16)}  ${p.basename(root)}',
             kind);
 
-    _log('📂 扫描：$root'
+    _log('📂 $root'
         '${subsOnly ? '（只下载字幕）' : dry ? '（试运行，不会改动任何文件）' : ''}');
     if (s.keepAwake) keepAwake(true);
 
-    final files = await scanVideos(fsys, root);
+    final files = List<String>.of(_files);
     if (mounted) setState(() => _total = files.length);
-    _log('找到 ${files.length} 个视频文件');
+    _log('共 ${files.length} 个视频文件');
 
     final net = Net(s.proxy);
     var ok = 0, skip = 0, fail = 0;
@@ -1716,14 +1778,28 @@ class _HomePageState extends State<HomePage> {
     } finally {
       net.close();
       keepAwake(false);
-      await fsys.close();
     }
     await _commitBatch();
     _batch = null;
+
+    // 整理后文件位置会变，重新扫描一遍，保证下次操作的列表是最新的
+    var fresh = files;
+    if (!dry && !subsOnly) {
+      try {
+        fresh = await scanVideos(fsys, root);
+      } catch (_) {}
+    }
+    await fsys.close();
+
     _log('${dry ? '📋 试运行结束' : '🎉 完成'}：'
         '成功 $ok，跳过 $skip，失败/未识别 $fail'
         '${_failed.isNotEmpty ? '（可点下方按钮手动输入番号重试）' : ''}');
-    if (mounted) setState(() => _running = false);
+    if (mounted) {
+      setState(() {
+        _files = fresh;
+        _running = false;
+      });
+    }
   }
 
   /// 撤销上一次整理：文件移回原位，删除那次生成的 NFO/封面/剧照/字幕
@@ -1800,6 +1876,12 @@ class _HomePageState extends State<HomePage> {
       }
       all.removeLast();
       await saveJournal(all);
+      if (_selDir != null && _selKind == kind) {
+        try {
+          final fresh = await scanVideos(f, _selDir!);
+          if (mounted) setState(() => _files = fresh);
+        } catch (_) {}
+      }
       _log('↩ 已撤销：移回 $back 个文件'
           '${miss > 0 ? '，$miss 个没法移回（已不在原处，或原位置已有同名文件）' : ''}');
       if (mounted) setState(() => _undoCount = all.length);
@@ -1828,6 +1910,12 @@ class _HomePageState extends State<HomePage> {
     try {
       fs = await _openFs(_failKind);
       code = await _processOne(net, fs, f.path, forceNum: num);
+      if (code == 0 && _selDir != null && _selKind == _failKind) {
+        try {
+          final fresh = await scanVideos(fs, _selDir!);
+          if (mounted) setState(() => _files = fresh);
+        } catch (_) {}
+      }
     } catch (e) {
       _log('❌ 出错：${errText(e)}');
     } finally {
@@ -2104,6 +2192,8 @@ class _HomePageState extends State<HomePage> {
 
   @override
   Widget build(BuildContext context) {
+    final busy = _running || _scanning;
+    final canRun = !busy && _selDir != null && _files.isNotEmpty;
     return Scaffold(
       appBar: AppBar(
         title: const Text('影片刮削器 v$appVersion'),
@@ -2111,7 +2201,7 @@ class _HomePageState extends State<HomePage> {
           IconButton(
             tooltip: '撤销上次整理',
             icon: const Icon(Icons.undo),
-            onPressed: (_running || _undoCount == 0) ? null : _undoLast,
+            onPressed: (busy || _undoCount == 0) ? null : _undoLast,
           ),
           IconButton(
             tooltip: '复制日志',
@@ -2126,7 +2216,7 @@ class _HomePageState extends State<HomePage> {
           IconButton(
             tooltip: '设置',
             icon: const Icon(Icons.settings),
-            onPressed: _running ? null : _openSettings,
+            onPressed: busy ? null : _openSettings,
           ),
         ],
       ),
@@ -2151,12 +2241,47 @@ class _HomePageState extends State<HomePage> {
                   ),
                 ],
                 selected: {s.source},
-                onSelectionChanged: _running
+                onSelectionChanged: busy
                     ? null
                     : (v) {
-                        setState(() => s.source = v.first);
+                        setState(() {
+                          s.source = v.first;
+                          // 换了来源，之前选的文件夹就不适用了
+                          if (_selDir != null && _selKind != s.source) {
+                            _selDir = null;
+                            _files = [];
+                            _failed.clear();
+                          }
+                        });
                         _saveCfg();
                       },
+              ),
+            ),
+            const SizedBox(height: 8),
+            Card(
+              margin: EdgeInsets.zero,
+              child: ListTile(
+                leading: const Icon(Icons.folder_open),
+                title: Text(
+                  _selDir ?? '① 选择影片文件夹',
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                subtitle: Text(_scanning
+                    ? '正在扫描…'
+                    : _selDir == null
+                        ? '先选文件夹，再选择下面的操作'
+                        : (_files.isEmpty
+                            ? '没有找到视频文件，点这里重新选择'
+                            : '找到 ${_files.length} 个视频　（点这里更换文件夹）')),
+                trailing: _selDir == null
+                    ? null
+                    : IconButton(
+                        tooltip: '重新扫描',
+                        icon: const Icon(Icons.refresh),
+                        onPressed: busy ? null : _rescan,
+                      ),
+                onTap: busy ? null : _pickFolder,
               ),
             ),
             const SizedBox(height: 8),
@@ -2164,9 +2289,9 @@ class _HomePageState extends State<HomePage> {
               children: [
                 Expanded(
                   child: FilledButton.icon(
-                    onPressed: _running ? null : () => _start(),
-                    icon: const Icon(Icons.folder_open),
-                    label: Text(_running ? '处理中…' : '选择文件夹并开始刮削'),
+                    onPressed: canRun ? () => _run() : null,
+                    icon: const Icon(Icons.play_arrow),
+                    label: Text(_running ? '处理中…' : '② 开始刮削'),
                   ),
                 ),
                 if (_running) ...[
@@ -2183,7 +2308,7 @@ class _HomePageState extends State<HomePage> {
               children: [
                 Expanded(
                   child: OutlinedButton.icon(
-                    onPressed: _running ? null : () => _start(dry: true),
+                    onPressed: canRun ? () => _run(dry: true) : null,
                     icon: const Icon(Icons.visibility),
                     label: const Text('试运行预览'),
                   ),
@@ -2191,14 +2316,14 @@ class _HomePageState extends State<HomePage> {
                 const SizedBox(width: 8),
                 Expanded(
                   child: FilledButton.tonalIcon(
-                    onPressed: _running ? null : () => _start(subsOnly: true),
+                    onPressed: canRun ? () => _run(subsOnly: true) : null,
                     icon: const Icon(Icons.subtitles),
                     label: const Text('只下载字幕'),
                   ),
                 ),
               ],
             ),
-            if (_failed.isNotEmpty && !_running)
+            if (_failed.isNotEmpty && !busy)
               Padding(
                 padding: const EdgeInsets.only(top: 8),
                 child: SizedBox(
