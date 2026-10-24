@@ -17,7 +17,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:smb_connect/smb_connect.dart' as smb;
 
 /// 每次修改代码都要同步修改这里和 pubspec.yaml 里的 version
-const appVersion = '1.4.1';
+const appVersion = '1.5.0';
 
 void main() => runApp(const ScraperApp());
 
@@ -59,7 +59,15 @@ class ScraperApp extends StatelessWidget {
 
 // ═══════════════════════ 配置 ═══════════════════════
 
-const _cfgPath = '/storage/emulated/0/刮削器/config.json';
+/// 设置与撤销记录的保存位置：安卓在手机根目录，电脑在 %APPDATA%\影片刮削器
+final String _dataDir = Platform.isAndroid
+    ? '/storage/emulated/0/刮削器'
+    : p.join(
+        Platform.environment['APPDATA'] ??
+            Platform.environment['HOME'] ??
+            Directory.systemTemp.path,
+        '影片刮削器');
+final String _cfgPath = p.join(_dataDir, 'config.json');
 
 class Cfg {
   String javbusUrl = 'https://www.javbus.com';
@@ -738,7 +746,7 @@ Future<(Uint8List, String)?> fetchSubtitle(
 
 // ═══════════════════════ 整理记录（用于撤销）═══════════════════════
 
-const _journalPath = '/storage/emulated/0/刮削器/journal.json';
+final String _journalPath = p.join(_dataDir, 'journal.json');
 
 Future<List<Map<String, dynamic>>> loadJournal() async {
   try {
@@ -952,7 +960,11 @@ Future<List<String>> scanVideos(Fs fs, String root) async {
         final name = e.name;
         if (e.isDir) {
           // 跳过群晖回收站、缩略图等系统目录
-          if (name.startsWith('@') || name.startsWith('#') || name.startsWith('.')) {
+          if (name.startsWith('@') ||
+              name.startsWith('#') ||
+              name.startsWith('.') ||
+              name.startsWith('\$') ||
+              name == 'System Volume Information') {
             continue;
           }
           stack.add(e.path);
@@ -1293,6 +1305,7 @@ class _HomePageState extends State<HomePage> {
       if (!mounted) return;
       setState(() {
         s.load(j);
+        if (!Platform.isAndroid) s.source = 'local';
         themeNotifier.value = themeFromString(s.themeMode);
         _applyCtl();
       });
@@ -1308,6 +1321,7 @@ class _HomePageState extends State<HomePage> {
     s.smbUser = _smbUserCtl.text.trim();
     s.smbPass = _smbPassCtl.text;
     s.smbDomain = _smbDomainCtl.text.trim();
+    if (!Platform.isAndroid) s.source = 'local';
   }
 
   Future<void> _saveCfg() async {
@@ -1739,7 +1753,7 @@ class _HomePageState extends State<HomePage> {
 
     _log('📂 $root'
         '${subsOnly ? '（只下载字幕）' : dry ? '（试运行，不会改动任何文件）' : ''}');
-    if (s.keepAwake) keepAwake(true);
+    if (Platform.isAndroid && s.keepAwake) keepAwake(true);
 
     final files = List<String>.of(_files);
     if (mounted) setState(() => _total = files.length);
@@ -2067,6 +2081,7 @@ class _HomePageState extends State<HomePage> {
                 _field(_javbusCtl, 'JavBus 网址（可换镜像）'),
                 _field(_javdbCtl, 'JavDB 网址'),
                 _field(_proxyCtl, 'HTTP 代理（可留空），如 127.0.0.1:7890'),
+                if (Platform.isAndroid) ...[
                 _title('网络共享（SMB）：NAS / 电脑共享文件夹'),
                 const Text(
                   '在主界面选择「网络共享」后，就能直接刮削 NAS 或电脑共享出来的视频。'
@@ -2078,6 +2093,7 @@ class _HomePageState extends State<HomePage> {
                 _field(_smbUserCtl, '用户名（匿名共享可填 guest）'),
                 _field(_smbPassCtl, '密码', secret: true),
                 _field(_smbDomainCtl, '域 / 工作组（一般留空）'),
+                ],
                 _title('整理'),
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
@@ -2114,6 +2130,7 @@ class _HomePageState extends State<HomePage> {
                   value: s.skipExisting,
                   onChanged: (v) => setM(() => s.skipExisting = v),
                 ),
+                if (Platform.isAndroid)
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
                   title: const Text('处理时保持屏幕常亮'),
@@ -2224,6 +2241,7 @@ class _HomePageState extends State<HomePage> {
         padding: const EdgeInsets.all(12),
         child: Column(
           children: [
+            if (Platform.isAndroid)
             SizedBox(
               width: double.infinity,
               child: SegmentedButton<String>(
