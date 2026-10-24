@@ -2,10 +2,11 @@
 
 ![Flutter](https://img.shields.io/badge/Framework-Flutter-02569B?logo=flutter)
 ![Dart](https://img.shields.io/badge/Language-Dart-0175C2?logo=dart)
-![Version](https://img.shields.io/badge/Version-1.4.1-green)
+![Version](https://img.shields.io/badge/Version-1.5.0-green)
+![Platform](https://img.shields.io/badge/Platform-Android%20%7C%20Windows-blue)
 ![Build](https://img.shields.io/badge/Build-GitHub%20Actions-2088FF?logo=github-actions)
 
-**影片刮削器** 是一款基于 **Flutter** 开发的高效 Android 移动端视频刮削与整理工具。能够智能识别本地视频文件（或 NAS / 电脑共享文件夹里的视频）的番号，从多个数据源抓取详细的元数据、高清封面与剧照，自动生成标准 Emby/Jellyfin/Kodi 通用的 NFO 信息文件，并支持标题翻译、多语言中文字幕下载与视频文件自动分类整理。
+**影片刮削器** 是一款基于 **Flutter** 开发的高效 **Android 手机 / Windows 电脑** 双平台视频刮削与整理工具。能够智能识别本地视频文件（或 NAS / 电脑共享文件夹里的视频）的番号，从多个数据源抓取详细的元数据、高清封面与剧照，自动生成标准 Emby/Jellyfin/Kodi 通用的 NFO 信息文件，并支持标题翻译、多语言中文字幕下载与视频文件自动分类整理。
 
 ---
 
@@ -15,6 +16,7 @@
 - [支持数据源](#-支持数据源)
 - [整理后的文件目录示范](#-整理后的文件目录示范)
 - [设置项一览](#-设置项一览)
+- [Windows 电脑版](#-windows-电脑版)
 - [环境要求与本地构建](#-环境要求与本地构建)
 - [使用 GitHub Actions 云端打包](#-使用-github-actions-云端打包)
 - [使用说明](#-使用说明)
@@ -109,20 +111,34 @@
 
 | 分类 | 设置项 | 说明 |
 | :--- | :--- | :--- |
-| 主界面 | 本机存储 / 网络共享 | 选择视频来源 |
+| 主界面 | 本机存储 / 网络共享 | 选择视频来源（仅安卓） |
 | 外观 | 跟随系统 / 浅色 / 夜间 | 主题模式，立即生效 |
 | 刮削源 | JavBus / JavDB / DMM 封面 | 可多选，结果合并 |
 | 网址 | JavBus 网址、JavDB 网址、字幕站网址 | 可替换为镜像站 |
 | 网络 | HTTP 代理 | 如 `127.0.0.1:7890`，只支持 HTTP 代理 |
-| 网络共享 | 服务器地址、用户名、密码、域 | 匿名共享用户名可填 `guest` |
+| 网络共享 | 服务器地址、用户名、密码、域 | 匿名共享用户名可填 `guest`（仅安卓） |
 | 整理 | 刮削成功后整理到文件夹 | 文件夹命名：番号 / 番号+标题 / 原文件名 |
 | 整理 | 已有 NFO 的视频跳过 | 避免重复刮削 |
-| 整理 | 处理时保持屏幕常亮 | 默认开启 |
+| 整理 | 处理时保持屏幕常亮 | 默认开启（仅安卓） |
 | 图片 | 下载封面 / 下载剧照 | 剧照数量：5 / 10 / 20 / 全部 |
 | 翻译 | 翻译标题和类别 | 语言：简体 / 繁体 / English |
 | 字幕 | 刮削时自动下载中文字幕 | 实验性 |
 
-设置会自动保存到手机根目录的 `刮削器/config.json`，撤销记录保存在同目录的 `journal.json`。
+设置会自动保存：安卓在手机根目录的 `刮削器/config.json`，Windows 在 `%APPDATA%\影片刮削器\config.json`；撤销记录保存在同目录的 `journal.json`。
+
+---
+
+## 💻 Windows 电脑版
+
+同一份代码同时支持 Windows 电脑版，功能与手机版一致：番号识别、多源合并、封面与剧照、标题翻译、字幕下载、整理到文件夹、试运行预览、撤销整理、手动处理失败项。
+
+**获取方式**：推送代码后，在 GitHub 的 **Actions** 页面打开 `Build Windows` 的运行记录，在底部 **Artifacts** 下载 `video-scraper-windows`，解压后双击 `video_scraper.exe` 即可使用，不需要安装。
+
+**和手机版的区别**：
+- 不需要授予存储权限，直接选择文件夹即可。
+- 没有“本机存储 / 网络共享”切换和 SMB 设置。要刮削 NAS 或其他电脑共享的视频，请先在 Windows 里把共享文件夹**映射成网络驱动器**（如 `Z:`），再像普通文件夹一样选择它。
+- 没有“保持屏幕常亮”选项。
+- 若使用 Clash 等软件的“系统代理”模式，请在设置里把代理地址（如 `127.0.0.1:7890`）填到 `HTTP 代理` 中，软件不会自动读取系统代理。
 
 ---
 
@@ -169,11 +185,13 @@
 仓库根目录/
 ├── pubspec.yaml
 ├── lib/main.dart
-├── ci/debug.keystore                  # 固定签名文件（见下）
-└── .github/workflows/build-apk.yml
+├── ci/debug.keystore                  # 固定签名文件（见下，仅安卓需要）
+└── .github/workflows/
+    ├── build-apk.yml                  # 打包安卓 APK
+    └── build-windows.yml              # 打包 Windows 电脑版
 ```
 
-推送代码（或在 Actions 页面手动点击 Run workflow）即可打包，完成后在运行记录底部的 **Artifacts** 中下载 `app-release-apk`。
+推送代码（或在 Actions 页面手动点击 Run workflow）即可打包，完成后在运行记录底部的 **Artifacts** 中下载：安卓版为 `app-release-apk`，电脑版为 `video-scraper-windows`（Windows 打包脚本会附带 VC++ 运行库，电脑没装也能运行）。
 
 打包脚本会自动完成：
 - 补全安卓工程，并添加联网与存储权限；
@@ -219,6 +237,10 @@
   谷歌翻译在部分地区无法直连，请在设置中配置 HTTP 代理；翻译失败不影响其他功能。
 - **剧照显示“剧照：无”**：
   说明当前数据源没有解析到剧照地址（网站结构可能已变化），不影响封面和 NFO。
+- **Windows 提示“Windows 已保护你的电脑”**：
+  程序没有购买代码签名证书，第一次运行时点击“更多信息”→“仍要运行”即可。
+- **电脑版弹出缺少 DLL 的提示**：
+  请使用最新打包的版本（已附带 VC++ 运行库）；仍然不行可安装微软的 VC++ 2015-2022 运行库。
 - **新版 APK 无法覆盖安装**：
   请按上文放入 `ci/debug.keystore` 固定签名；第一次切换时需要先卸载旧版。
 
@@ -227,6 +249,12 @@
 ## 📝 更新日志
 
 > 每次更新都会在这里记录改动，版本号与 `pubspec.yaml`、软件标题栏保持一致。
+
+### v1.5.0
+- **新增 Windows 电脑版**：同一份代码同时支持安卓与 Windows，新增 `build-windows.yml` 云端打包，窗口标题为「影片刮削器」，并附带 VC++ 运行库。
+- 电脑版的设置与撤销记录保存在 `%APPDATA%\影片刮削器`。
+- 电脑版隐藏安卓专用选项（本机/网络共享切换、SMB 设置、屏幕常亮）；NAS 共享请映射成网络驱动器后使用。
+- 扫描时自动跳过 Windows 回收站（`$RECYCLE.BIN`）和 `System Volume Information`。
 
 ### v1.4.1
 - **操作流程调整**：先选择影片文件夹（自动扫描并显示视频数量），再选择「开始刮削 / 试运行预览 / 只下载字幕」，选一次文件夹可连续执行多个操作，不用每次重新选择。
