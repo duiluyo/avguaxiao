@@ -1,7 +1,7 @@
 name: video_scraper
 description: 影片刮削器
 publish_to: "none"
-version: 1.4.0+6
+version: 1.4.1+7
 
 environment:
   sdk: ">=3.3.0 <4.0.0"
