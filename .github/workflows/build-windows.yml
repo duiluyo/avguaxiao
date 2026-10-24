@@ -19,67 +19,79 @@ jobs:
           channel: stable
           cache: true
 
-      - name: 补全 Windows 工程文件（如果缺失）
-        shell: bash
+      - name: 生成 Windows 工程
+        shell: pwsh
         run: |
-          if [ ! -d "windows" ]; then
+          if (-not (Test-Path "windows/CMakeLists.txt")) {
             flutter create --platforms=windows --project-name video_scraper .
-          fi
+            if ($LASTEXITCODE -ne 0) {
+              throw "Windows 工程生成失败"
+            }
+          }
 
-      - name: 窗口标题改成影片刮削器
+          if (-not (Test-Path "windows/CMakeLists.txt")) {
+            throw "未找到 windows/CMakeLists.txt"
+          }
+
+      - name: 修复 MSVC 协程兼容性
+        shell: pwsh
+        run: |
+          $path = "windows/CMakeLists.txt"
+          $content = Get-Content $path -Raw
+
+          $macro = "add_compile_definitions(_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS)"
+
+          if ($content -notmatch [regex]::Escape("_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS")) {
+            $pattern = '(?m)^include\(flutter/generated_plugins\.cmake\)'
+            if ($content -notmatch $pattern) {
+              throw "找不到 generated_plugins.cmake，请检查 Windows 工程模板"
+            }
+
+            $content = [regex]::Replace(
+              $content,
+              $pattern,
+              "$macro`r`ninclude(flutter/generated_plugins.cmake)",
+              1
+            )
+
+            Set-Content -Path $path -Value $content -Encoding utf8
+          }
+
+          Write-Host "已配置 MSVC 协程兼容宏"
+
+      - name: 修改窗口标题
         shell: pwsh
         run: |
           $path = "windows/runner/main.cpp"
-
           if (-not (Test-Path $path)) {
-            Write-Error "找不到 $path"
-            exit 1
+            throw "找不到 $path"
           }
 
-          $content = [System.IO.File]::ReadAllText(
-            (Resolve-Path $path),
-            [System.Text.Encoding]::UTF8
-          )
+          $content = Get-Content $path -Raw
+          $old = 'L"video_scraper"'
+          $new = 'L"\u5F71\u7247\u522E\u524A\u5668"'
 
-          $oldTitle = 'L"video_scraper"'
-          $newTitle = 'L"\u5F71\u7247\u522E\u524A\u5668"'
-
-          if ($content.Contains($oldTitle)) {
-            $content = $content.Replace($oldTitle, $newTitle)
-
-            [System.IO.File]::WriteAllText(
-              (Resolve-Path $path),
-              $content,
-              [System.Text.UTF8Encoding]::new($false)
-            )
-
-            Write-Host "窗口标题已修改"
+          if ($content.Contains($old)) {
+            $content = $content.Replace($old, $new)
+            Set-Content -Path $path -Value $content -Encoding utf8
           }
-          elseif ($content.Contains($newTitle)) {
-            Write-Host "窗口标题已经是影片刮削器，无需修改"
-          }
-          else {
-            Write-Error "没有找到预期的窗口标题，请检查 main.cpp"
-            exit 1
+          elseif (-not $content.Contains($new)) {
+            Write-Warning "未找到预期标题，保留工程默认标题"
           }
 
       - name: 安装依赖
         run: flutter pub get
 
-      - name: 打包 Windows 程序
+      - name: 编译 Windows 正式版
         run: flutter build windows --release
 
-      - name: 附带 VC++ 运行库（电脑没装也能运行）
+      - name: 检查编译输出
         shell: pwsh
         run: |
           $dst = "build/windows/x64/runner/Release"
-
-          foreach ($f in "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll") {
-            $src = "C:\Windows\System32\$f"
-
-            if (Test-Path $src) {
-              Copy-Item $src $dst -Force
-            }
+          if (-not (Test-Path "$dst/video_scraper.exe")) {
+            Get-ChildItem $dst -ErrorAction SilentlyContinue
+            throw "未找到 video_scraper.exe，请检查编译输出"
           }
 
           Get-ChildItem $dst | Select-Object Name, Length
