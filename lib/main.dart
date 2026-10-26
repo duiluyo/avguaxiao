@@ -17,7 +17,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:smb_connect/smb_connect.dart' as smb;
 
 /// 每次修改代码都要同步修改这里和 pubspec.yaml 里的 version
-const appVersion = '1.5.0';
+const appVersion = '1.6.0';
 
 void main() => runApp(const ScraperApp());
 
@@ -94,6 +94,8 @@ class Cfg {
   int stillsMax = 10;
   bool translate = false;
   String trLang = 'zh-CN';
+  String folderTpl = '{番号}'; // 文件夹命名模板
+  String organizeBase = 'here'; // here=视频所在文件夹  root=所选根文件夹
 
   Map<String, dynamic> toJson() => {
         'javbusUrl': javbusUrl,
@@ -120,6 +122,8 @@ class Cfg {
         'stillsMax': stillsMax,
         'translate': translate,
         'trLang': trLang,
+        'folderTpl': folderTpl,
+        'organizeBase': organizeBase,
       };
 
   void load(Map<String, dynamic> j) {
@@ -147,6 +151,15 @@ class Cfg {
     stillsMax = (j['stillsMax'] ?? stillsMax) as int;
     translate = (j['translate'] ?? translate) as bool;
     trLang = (j['trLang'] ?? trLang) as String;
+    organizeBase = (j['organizeBase'] ?? organizeBase) as String;
+    if (j['folderTpl'] is String) {
+      folderTpl = j['folderTpl'] as String;
+    } else {
+      // 兼容旧版本的三种固定命名方式
+      final fm = j['folderMode'];
+      if (fm == 'numTitle') folderTpl = '{番号} {标题}';
+      if (fm == 'orig') folderTpl = '{原文件名}';
+    }
   }
 }
 
@@ -157,8 +170,11 @@ const _ua = 'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 '
 
 class Net {
   late final http.Client _client;
+  final Duration timeout;
+  final int tries;
 
-  Net(String proxy) {
+  Net(String proxy,
+      {this.timeout = const Duration(seconds: 25), this.tries = 2}) {
     final hc = HttpClient()..connectionTimeout = const Duration(seconds: 15);
     final px = proxy
         .trim()
@@ -181,11 +197,11 @@ class Net {
       if (extra != null) ...extra,
     };
     Object? last;
-    for (var i = 0; i < 2; i++) {
+    for (var i = 0; i < tries; i++) {
       try {
         return await _client
             .get(uri, headers: headers)
-            .timeout(const Duration(seconds: 25));
+            .timeout(timeout);
       } catch (e) {
         last = e;
       }
@@ -579,21 +595,53 @@ String safeName(String s, {int max = 80}) {
   return t;
 }
 
-/// mode: num=番号  numTitle=番号+标题  orig=原文件名
-String folderNameFor(Movie m, String mode, String origStem) {
-  String n;
-  switch (mode) {
-    case 'numTitle':
-      n = '${m.num} ${m.displayTitle}';
-      break;
-    case 'orig':
-      n = origStem;
-      break;
-    default:
-      n = m.num;
+/// 按模板生成文件夹名（可以是多层）。用 / 分层。
+/// 可用变量：{番号} {标题} {原标题} {演员} {年份} {日期} {厂商} {系列} {导演} {原文件名}
+/// 演员超过 3 位归入「多人作品」，没有演员信息归入「未知演员」
+List<String> folderPartsFor(Movie m, String template, String origStem) {
+  final tpl = template.trim().isEmpty ? '{番号}' : template.trim();
+  final actor = m.actors.isEmpty
+      ? '未知演员'
+      : (m.actors.length > 3 ? '多人作品' : m.actors.first);
+  final year = m.date.length >= 4 ? m.date.substring(0, 4) : '';
+  final vars = <String, String>{
+    '番号': m.num,
+    'num': m.num,
+    '标题': m.displayTitle,
+    'title': m.displayTitle,
+    '原标题': m.title,
+    '演员': actor,
+    'actor': actor,
+    '年份': year,
+    'year': year,
+    '日期': m.date,
+    'date': m.date,
+    '厂商': m.studio,
+    'studio': m.studio,
+    '系列': m.series,
+    'series': m.series,
+    '导演': m.director,
+    '原文件名': origStem,
+  };
+  final parts = <String>[];
+  for (final seg in tpl.split(RegExp(r'[/\\]'))) {
+    final filled = seg.replaceAllMapped(
+        RegExp(r'\{([^{}]+)\}'), (mt) => vars[mt.group(1)!.trim()] ?? '');
+    final clean = safeName(filled);
+    if (clean.isNotEmpty) parts.add(clean);
   }
-  n = safeName(n);
-  return n.isEmpty ? m.num : n;
+  return parts.isEmpty ? [safeName(m.num)] : parts;
+}
+
+/// 目录 dir 的末尾几层是否正好等于 parts（说明已经在对应的文件夹里了）
+bool _tailMatches(String dir, List<String> parts) {
+  final segs = p.split(dir);
+  if (segs.length < parts.length) return false;
+  final tail = segs.sublist(segs.length - parts.length);
+  for (var i = 0; i < parts.length; i++) {
+    if (tail[i] != parts[i]) return false;
+  }
+  return true;
 }
 
 Future<File> moveFile(File f, String newPath) async {
@@ -618,8 +666,18 @@ Future<String> organizeInto(Fs fs, String video, String destDir,
   final srcDir = p.dirname(video);
   if (p.equals(srcDir, destDir)) return video;
   if (!await fs.exists(destDir)) {
+    final missing = <String>[];
+    var cur = destDir;
+    while (!await fs.exists(cur)) {
+      missing.add(cur);
+      final up = p.dirname(cur);
+      if (up == cur) break;
+      cur = up;
+    }
     await fs.mkdirs(destDir);
-    newDirs?.add(destDir);
+    for (final d in missing.reversed) {
+      newDirs?.add(d);
+    }
   }
 
   final stem = p.basenameWithoutExtension(video);
@@ -1178,6 +1236,143 @@ class _RemoteDirPickerState extends State<RemoteDirPicker> {
   }
 }
 
+// ═══════════════════════ 连接测试 ═══════════════════════
+
+class DiagCheck {
+  final String name;
+  final Future<(bool, String)> Function(Net net) run;
+  DiagCheck(this.name, this.run);
+}
+
+/// 打开一个网页，判断能不能正常访问
+Future<(bool, String)> pageCheck(Net net, String url,
+    {Map<String, String>? extra}) async {
+  if (url.trim().isEmpty) return (false, '没有填写网址');
+  final r = await net.get(trimSlash(url), extra: extra);
+  final body = decodeBody(r);
+  if (looksBlocked(body)) {
+    return (false, 'HTTP ${r.statusCode}，被 Cloudflare 拦截（可以试试代理）');
+  }
+  if (r.statusCode == 200) return (true, '页面正常');
+  return (false, 'HTTP ${r.statusCode}');
+}
+
+class DiagDialog extends StatefulWidget {
+  final List<DiagCheck> checks;
+  final String proxy;
+  const DiagDialog({super.key, required this.checks, required this.proxy});
+
+  @override
+  State<DiagDialog> createState() => _DiagDialogState();
+}
+
+class _DiagDialogState extends State<DiagDialog> {
+  late final Net net;
+  late List<int> state; // 0=测试中 1=正常 2=失败
+  late List<String> detail;
+
+  @override
+  void initState() {
+    super.initState();
+    net = Net(widget.proxy, timeout: const Duration(seconds: 12), tries: 1);
+    state = List.filled(widget.checks.length, 0);
+    detail = List.filled(widget.checks.length, '测试中…');
+    _runAll();
+  }
+
+  @override
+  void dispose() {
+    net.close();
+    super.dispose();
+  }
+
+  Future<void> _runAll() async {
+    if (mounted) {
+      setState(() {
+        state = List.filled(widget.checks.length, 0);
+        detail = List.filled(widget.checks.length, '测试中…');
+      });
+    }
+    await Future.wait([
+      for (var i = 0; i < widget.checks.length; i++) _runOne(i),
+    ]);
+  }
+
+  Future<void> _runOne(int i) async {
+    final sw = Stopwatch()..start();
+    try {
+      final r =
+          await widget.checks[i].run(net).timeout(const Duration(seconds: 20));
+      final ms = sw.elapsedMilliseconds;
+      if (!mounted) return;
+      setState(() {
+        state[i] = r.$1 ? 1 : 2;
+        detail[i] = '${r.$2}（$ms 毫秒）';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        state[i] = 2;
+        detail[i] = errText(e);
+      });
+    }
+  }
+
+  String _report() {
+    final b = StringBuffer('连接测试 v$appVersion\n');
+    for (var i = 0; i < widget.checks.length; i++) {
+      final mark = state[i] == 1 ? '✓' : (state[i] == 2 ? '✗' : '…');
+      b.writeln('$mark ${widget.checks[i].name}：${detail[i]}');
+    }
+    return b.toString();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('连接测试'),
+      content: SizedBox(
+        width: double.maxFinite,
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            for (var i = 0; i < widget.checks.length; i++)
+              ListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                leading: state[i] == 0
+                    ? const SizedBox(
+                        width: 22,
+                        height: 22,
+                        child: CircularProgressIndicator(strokeWidth: 2))
+                    : Icon(
+                        state[i] == 1 ? Icons.check_circle : Icons.cancel,
+                        color: state[i] == 1 ? Colors.green : Colors.red,
+                      ),
+                title: Text(widget.checks[i].name),
+                subtitle: Text(detail[i]),
+              ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () {
+            Clipboard.setData(ClipboardData(text: _report()));
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('测试结果已复制')),
+            );
+          },
+          child: const Text('复制结果'),
+        ),
+        TextButton(onPressed: _runAll, child: const Text('重新测试')),
+        FilledButton(
+            onPressed: () => Navigator.pop(context), child: const Text('关闭')),
+      ],
+    );
+  }
+}
+
 // ═══════════════════════ NFO ═══════════════════════
 
 String _x(String s) => s
@@ -1246,6 +1441,7 @@ class _HomePageState extends State<HomePage> {
   final _smbUserCtl = TextEditingController();
   final _smbPassCtl = TextEditingController();
   final _smbDomainCtl = TextEditingController();
+  final _tplCtl = TextEditingController();
   final _logs = <String>[];
   final _scroll = ScrollController();
   bool _running = false;
@@ -1282,6 +1478,7 @@ class _HomePageState extends State<HomePage> {
     _smbUserCtl.dispose();
     _smbPassCtl.dispose();
     _smbDomainCtl.dispose();
+    _tplCtl.dispose();
     _scroll.dispose();
     super.dispose();
   }
@@ -1295,6 +1492,7 @@ class _HomePageState extends State<HomePage> {
     _smbUserCtl.text = s.smbUser;
     _smbPassCtl.text = s.smbPass;
     _smbDomainCtl.text = s.smbDomain;
+    _tplCtl.text = s.folderTpl;
   }
 
   Future<void> _loadCfg() async {
@@ -1321,6 +1519,7 @@ class _HomePageState extends State<HomePage> {
     s.smbUser = _smbUserCtl.text.trim();
     s.smbPass = _smbPassCtl.text;
     s.smbDomain = _smbDomainCtl.text.trim();
+    s.folderTpl = _tplCtl.text.trim().isEmpty ? '{番号}' : _tplCtl.text.trim();
     if (!Platform.isAndroid) s.source = 'local';
   }
 
@@ -1420,6 +1619,101 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  /// 计算整理后的目标文件夹
+  String _destDir(List<String> parts, String vpath) {
+    final cur = p.dirname(vpath);
+    if (s.organizeBase == 'root' && _selDir != null && _selKind == _failKind) {
+      return p.joinAll([_selDir!, ...parts]);
+    }
+    if (_tailMatches(cur, parts)) return cur; // 已经在对应文件夹里，不再套一层
+    return p.joinAll([cur, ...parts]);
+  }
+
+  /// 设置里显示的模板示例
+  String _tplExample() {
+    final m = Movie('SSIS-123')
+      ..title = '示例标题'
+      ..date = '2021-05-01'
+      ..studio = '示例厂商'
+      ..series = '示例系列'
+      ..director = '示例导演'
+      ..actors = ['示例演员'];
+    final tpl = _tplCtl.text.trim().isEmpty ? '{番号}' : _tplCtl.text.trim();
+    return folderPartsFor(m, tpl, 'SSIS-123').join('/');
+  }
+
+  List<DiagCheck> _buildChecks() {
+    final checks = <DiagCheck>[];
+    final px = s.proxy.trim();
+    if (px.isNotEmpty) {
+      checks.add(DiagCheck('代理 $px', (net) async {
+        final hp = px
+            .replaceFirst(RegExp(r'^[a-zA-Z]+://'), '')
+            .replaceAll(RegExp(r'/+$'), '');
+        final i = hp.lastIndexOf(':');
+        if (i <= 0) return (false, '格式不对，应该是 地址:端口');
+        final port = int.tryParse(hp.substring(i + 1));
+        if (port == null) return (false, '端口不是数字');
+        final sock = await Socket.connect(hp.substring(0, i), port,
+            timeout: const Duration(seconds: 4));
+        sock.destroy();
+        return (true, '代理端口可以连接');
+      }));
+    }
+    if (s.useJavbus) {
+      checks.add(DiagCheck(
+          'JavBus', (net) => pageCheck(net, s.javbusUrl, extra: {
+                'Cookie': 'existmag=all; age=verified; dv=1',
+              })));
+    }
+    if (s.useJavdb) {
+      checks.add(DiagCheck(
+          'JavDB',
+          (net) => pageCheck(net, s.javdbUrl,
+              extra: {'Cookie': 'over18=1; locale=zh'})));
+    }
+    if (s.useDmm || s.downloadCover) {
+      checks.add(DiagCheck('DMM 封面图床', (net) async {
+        final r = await net.get(
+            'https://awsimgsrc.dmm.co.jp/pics_dig/digital/video/ssis00001/ssis00001pl.jpg');
+        if (r.statusCode == 200) return (true, '可以访问，图片正常');
+        if (r.statusCode == 404) return (true, '服务器可以访问（测试图片不存在，不影响使用）');
+        return (false, 'HTTP ${r.statusCode}');
+      }));
+    }
+    if (s.translate) {
+      checks.add(DiagCheck('翻译（谷歌）', (net) async {
+        final t = await _googleTr(net, 'こんにちは', s.trLang, 'ja');
+        if (t == null || t.trim().isEmpty) return (false, '没有返回结果');
+        return (true, '翻译正常：こんにちは → ${t.trim()}');
+      }));
+    }
+    if (s.downloadSub) {
+      checks.add(DiagCheck('字幕站', (net) => pageCheck(net, s.subUrl)));
+    }
+    if (Platform.isAndroid && s.smbHost.isNotEmpty) {
+      checks.add(DiagCheck('网络共享 ${s.smbHost}', (net) async {
+        final fs = await _openFs('smb');
+        try {
+          final shares = await fs.list('/');
+          return (true, '连接成功，找到 ${shares.length} 个共享');
+        } finally {
+          await fs.close();
+        }
+      }));
+    }
+    return checks;
+  }
+
+  void _openDiag() {
+    _syncCfg();
+    final checks = _buildChecks();
+    showDialog(
+      context: context,
+      builder: (_) => DiagDialog(checks: checks, proxy: s.proxy),
+    );
+  }
+
   /// 返回 0=成功 1=跳过 2=失败
   Future<int> _processOne(Net net, Fs fs, String vpath,
       {String? forceNum, bool dry = false}) async {
@@ -1467,13 +1761,14 @@ class _HomePageState extends State<HomePage> {
     if (s.translate) await _translateMovie(net, m);
 
     // 试运行：只预览，不改动任何文件
+    final parts = folderPartsFor(m, s.folderTpl, stem);
     if (dry) {
-      final folder = folderNameFor(m, s.folderMode, stem);
+      final dest = _destDir(parts, vpath);
       final where = !s.organize
           ? '不整理'
-          : (p.basename(p.dirname(vpath)) == folder
+          : (p.equals(p.dirname(vpath), dest)
               ? '已在正确的文件夹里'
-              : '将移动到 $folder/');
+              : '将移动到 ${parts.join('/')}/');
       final will = [
         'NFO',
         if (s.downloadCover) '封面',
@@ -1488,15 +1783,13 @@ class _HomePageState extends State<HomePage> {
     // 整理：新建文件夹，把视频和同名附属文件移进去
     var organized = '';
     if (s.organize) {
-      var destDir = p.dirname(vpath);
-      final folder = folderNameFor(m, s.folderMode, stem);
-      if (p.basename(destDir) != folder) destDir = p.join(destDir, folder);
+      final destDir = _destDir(parts, vpath);
       try {
         final moved = await organizeInto(fs, vpath, destDir,
             moves: _batch?['moves'] as List?,
             newDirs: _batch?['dirs'] as List?);
         base = p.withoutExtension(moved);
-        organized = folder;
+        organized = parts.join('/');
       } catch (e) {
         _log('   ⚠️ 整理失败：${errText(e)}（资料仍保存在原位置）');
       }
@@ -1532,8 +1825,7 @@ class _HomePageState extends State<HomePage> {
       } else {
         try {
           final parent = p.dirname(base);
-          final own =
-              organized.isNotEmpty || p.basename(parent) == folderNameFor(m, s.folderMode, stem);
+          final own = organized.isNotEmpty || _tailMatches(parent, parts);
           final dir = own
               ? p.join(parent, 'extrafanart')
               : p.join(parent, '$stem-extrafanart');
@@ -2006,12 +2298,14 @@ class _HomePageState extends State<HomePage> {
         child: Text(t, style: const TextStyle(fontWeight: FontWeight.bold)),
       );
 
-  Widget _field(TextEditingController c, String label, {bool secret = false}) =>
+  Widget _field(TextEditingController c, String label,
+          {bool secret = false, ValueChanged<String>? onChanged}) =>
       Padding(
         padding: const EdgeInsets.only(bottom: 10),
         child: TextField(
           controller: c,
           obscureText: secret,
+          onChanged: onChanged,
           decoration: InputDecoration(
             labelText: label,
             border: const OutlineInputBorder(),
@@ -2037,6 +2331,14 @@ class _HomePageState extends State<HomePage> {
               mainAxisSize: MainAxisSize.min,
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: TextButton.icon(
+                    onPressed: _openDiag,
+                    icon: const Icon(Icons.network_check),
+                    label: const Text('测试连接'),
+                  ),
+                ),
                 _title('外观'),
                 SegmentedButton<ThemeMode>(
                   showSelectedIcon: false,
@@ -2102,28 +2404,57 @@ class _HomePageState extends State<HomePage> {
                   value: s.organize,
                   onChanged: (v) => setM(() => s.organize = v),
                 ),
-                if (s.organize)
+                if (s.organize) ...[
+                  const SizedBox(height: 4),
+                  Wrap(
+                    spacing: 8,
+                    children: [
+                      for (final pr in const [
+                        ['番号', '{番号}'],
+                        ['番号+标题', '{番号} {标题}'],
+                        ['原文件名', '{原文件名}'],
+                        ['演员/番号', '{演员}/{番号}'],
+                        ['演员/番号+标题', '{演员}/{番号} {标题}'],
+                      ])
+                        ChoiceChip(
+                          label: Text(pr[0]),
+                          selected: _tplCtl.text.trim() == pr[1],
+                          onSelected: (_) => setM(() => _tplCtl.text = pr[1]),
+                        ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  _field(_tplCtl, '文件夹命名模板', onChanged: (_) => setM(() {})),
+                  Text(
+                    '可用：{番号} {标题} {原标题} {演员} {年份} {日期} {厂商} {系列} {导演} {原文件名}\n'
+                    '用 / 表示多层文件夹，例如 {演员}/{番号}（按演员分类）。'
+                    '演员超过 3 位归入「多人作品」。\n'
+                    '示例结果：${_tplExample()}',
+                    style: const TextStyle(fontSize: 12),
+                  ),
+                  const SizedBox(height: 8),
                   Wrap(
                     spacing: 8,
                     children: [
                       ChoiceChip(
-                        label: const Text('文件夹名：番号'),
-                        selected: s.folderMode == 'num',
-                        onSelected: (_) => setM(() => s.folderMode = 'num'),
-                      ),
-                      ChoiceChip(
-                        label: const Text('番号+标题'),
-                        selected: s.folderMode == 'numTitle',
+                        label: const Text('整理在视频所在文件夹'),
+                        selected: s.organizeBase != 'root',
                         onSelected: (_) =>
-                            setM(() => s.folderMode = 'numTitle'),
+                            setM(() => s.organizeBase = 'here'),
                       ),
                       ChoiceChip(
-                        label: const Text('原文件名'),
-                        selected: s.folderMode == 'orig',
-                        onSelected: (_) => setM(() => s.folderMode = 'orig'),
+                        label: const Text('整理到所选根文件夹'),
+                        selected: s.organizeBase == 'root',
+                        onSelected: (_) =>
+                            setM(() => s.organizeBase = 'root'),
                       ),
                     ],
                   ),
+                  const Text(
+                    '按演员分类时建议选「所选根文件夹」，不同子文件夹里的影片会统一归到一起。',
+                    style: TextStyle(fontSize: 12),
+                  ),
+                ],
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
                   title: const Text('已有 NFO 的视频跳过'),
@@ -2215,6 +2546,11 @@ class _HomePageState extends State<HomePage> {
       appBar: AppBar(
         title: const Text('影片刮削器 v$appVersion'),
         actions: [
+          IconButton(
+            tooltip: '测试连接',
+            icon: const Icon(Icons.network_check),
+            onPressed: busy ? null : _openDiag,
+          ),
           IconButton(
             tooltip: '撤销上次整理',
             icon: const Icon(Icons.undo),
