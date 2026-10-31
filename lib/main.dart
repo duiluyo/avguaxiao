@@ -17,7 +17,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:smb_connect/smb_connect.dart' as smb;
 
 /// 每次修改代码都要同步修改这里和 pubspec.yaml 里的 version
-const appVersion = '1.6.0';
+const appVersion = '1.7.0';
 
 void main() => runApp(const ScraperApp());
 
@@ -96,6 +96,7 @@ class Cfg {
   String trLang = 'zh-CN';
   String folderTpl = '{番号}'; // 文件夹命名模板
   String organizeBase = 'here'; // here=视频所在文件夹  root=所选根文件夹
+  bool autoLibrary = true; // 电脑版：刮削后自动加入影视库
 
   Map<String, dynamic> toJson() => {
         'javbusUrl': javbusUrl,
@@ -124,6 +125,7 @@ class Cfg {
         'trLang': trLang,
         'folderTpl': folderTpl,
         'organizeBase': organizeBase,
+        'autoLibrary': autoLibrary,
       };
 
   void load(Map<String, dynamic> j) {
@@ -160,6 +162,7 @@ class Cfg {
       if (fm == 'numTitle') folderTpl = '{番号} {标题}';
       if (fm == 'orig') folderTpl = '{原文件名}';
     }
+    autoLibrary = (j['autoLibrary'] ?? autoLibrary) as bool;
   }
 }
 
@@ -1373,6 +1376,1471 @@ class _DiagDialogState extends State<DiagDialog> {
   }
 }
 
+// ═══════════════════════ 影视库（电脑版）═══════════════════════
+
+const _imgExts = {'.jpg', '.jpeg', '.png', '.webp'};
+
+/// 影视库里的一部影片
+class LibItem {
+  final String path; // 视频完整路径
+  String num = '';
+  String title = '';
+  String origTitle = '';
+  String date = '';
+  int runtime = 0;
+  String studio = '';
+  String director = '';
+  String series = '';
+  List<String> genres = [];
+  List<String> actors = [];
+  List<String> tags = [];
+  bool hasNfo = false;
+  int nfoMtime = 0;
+  int nfoSize = 0;
+  int added = 0; // 视频文件的修改时间（毫秒），用作「添加时间」
+  String poster = '';
+  String fanart = '';
+  bool hasStills = false;
+
+  LibItem(this.path);
+
+  String get dir => p.dirname(path);
+  String get stem => p.basenameWithoutExtension(path);
+  String get year => date.length >= 4 ? date.substring(0, 4) : '';
+
+  /// 收藏、已看的记录用番号做键，整理移动文件后也不会丢；没有番号就用路径
+  String get key => num.isNotEmpty ? num : path;
+
+  /// 有 NFO 但找不到封面
+  bool get incomplete => hasNfo && poster.isEmpty && fanart.isEmpty;
+
+  void copyMetaFrom(LibItem o) {
+    num = o.num;
+    title = o.title;
+    origTitle = o.origTitle;
+    date = o.date;
+    runtime = o.runtime;
+    studio = o.studio;
+    director = o.director;
+    series = o.series;
+    genres = List.of(o.genres);
+    actors = List.of(o.actors);
+    tags = List.of(o.tags);
+  }
+
+  Map<String, dynamic> toJson() => {
+        'path': path,
+        'num': num,
+        'title': title,
+        'origTitle': origTitle,
+        'date': date,
+        'runtime': runtime,
+        'studio': studio,
+        'director': director,
+        'series': series,
+        'genres': genres,
+        'actors': actors,
+        'tags': tags,
+        'hasNfo': hasNfo,
+        'nfoMtime': nfoMtime,
+        'nfoSize': nfoSize,
+        'added': added,
+        'poster': poster,
+        'fanart': fanart,
+        'hasStills': hasStills,
+      };
+
+  factory LibItem.fromJson(Map<String, dynamic> j) {
+    final it = LibItem(j['path'] as String);
+    it.num = (j['num'] ?? '') as String;
+    it.title = (j['title'] ?? '') as String;
+    it.origTitle = (j['origTitle'] ?? '') as String;
+    it.date = (j['date'] ?? '') as String;
+    it.runtime = (j['runtime'] ?? 0) as int;
+    it.studio = (j['studio'] ?? '') as String;
+    it.director = (j['director'] ?? '') as String;
+    it.series = (j['series'] ?? '') as String;
+    it.genres = ((j['genres'] ?? []) as List).cast<String>().toList();
+    it.actors = ((j['actors'] ?? []) as List).cast<String>().toList();
+    it.tags = ((j['tags'] ?? []) as List).cast<String>().toList();
+    it.hasNfo = (j['hasNfo'] ?? false) as bool;
+    it.nfoMtime = (j['nfoMtime'] ?? 0) as int;
+    it.nfoSize = (j['nfoSize'] ?? 0) as int;
+    it.added = (j['added'] ?? 0) as int;
+    it.poster = (j['poster'] ?? '') as String;
+    it.fanart = (j['fanart'] ?? '') as String;
+    it.hasStills = (j['hasStills'] ?? false) as bool;
+    return it;
+  }
+}
+
+// ---------- 读取 NFO（简单的标签提取，兼容 CDATA 和其他刮削器的 NFO）----------
+
+String _xmlText(String s) {
+  var t = s.trim();
+  final cd = RegExp(r'^<!\[CDATA\[(.*)\]\]>$', dotAll: true).firstMatch(t);
+  if (cd != null) t = cd.group(1)!;
+  return t
+      .replaceAll('&lt;', '<')
+      .replaceAll('&gt;', '>')
+      .replaceAll('&quot;', '"')
+      .replaceAll('&apos;', "'")
+      .replaceAll('&#39;', "'")
+      .replaceAll('&amp;', '&')
+      .trim();
+}
+
+String _nfoFirst(String xml, String tag) {
+  final m =
+      RegExp('<$tag(?:\\s[^>]*)?>(.*?)</$tag>', dotAll: true).firstMatch(xml);
+  return m == null ? '' : _xmlText(m.group(1)!);
+}
+
+List<String> _nfoAll(String xml, String tag) {
+  final out = <String>[];
+  for (final m
+      in RegExp('<$tag(?:\\s[^>]*)?>(.*?)</$tag>', dotAll: true)
+          .allMatches(xml)) {
+    final v = _xmlText(m.group(1)!);
+    if (v.isNotEmpty && !out.contains(v)) out.add(v);
+  }
+  return out;
+}
+
+void applyNfo(LibItem it, String xml) {
+  var num = _nfoFirst(xml, 'num');
+  if (num.isEmpty) {
+    final u = RegExp(r'<uniqueid[^>]*type="num"[^>]*>(.*?)</uniqueid>',
+            dotAll: true)
+        .firstMatch(xml);
+    if (u != null) num = _xmlText(u.group(1)!);
+  }
+  if (num.isEmpty) num = extractCode(it.stem) ?? '';
+  it.num = num;
+
+  var title = _nfoFirst(xml, 'title');
+  if (num.isNotEmpty && title.toUpperCase().startsWith(num.toUpperCase())) {
+    title = title.substring(num.length).trim();
+  }
+  it.title = title.isEmpty ? it.stem : title;
+  it.origTitle = _nfoFirst(xml, 'originaltitle');
+
+  var date = _nfoFirst(xml, 'premiered');
+  if (date.isEmpty) date = _nfoFirst(xml, 'releasedate');
+  if (date.isEmpty) date = _nfoFirst(xml, 'year');
+  it.date = date;
+  it.runtime = int.tryParse(_nfoFirst(xml, 'runtime')) ?? 0;
+  it.studio = _nfoFirst(xml, 'studio');
+  it.director = _nfoFirst(xml, 'director');
+
+  final setRaw =
+      RegExp(r'<set(?:\s[^>]*)?>(.*?)</set>', dotAll: true).firstMatch(xml)
+              ?.group(1) ??
+          '';
+  final setName = _nfoFirst(setRaw, 'name');
+  it.series = setName.isNotEmpty
+      ? setName
+      : (setRaw.contains('<') ? '' : _xmlText(setRaw));
+
+  it.genres = _nfoAll(xml, 'genre');
+  it.tags = _nfoAll(xml, 'tag').where((t) => !it.genres.contains(t)).toList();
+
+  final actors = <String>[];
+  for (final m in RegExp(r'<actor(?:\s[^>]*)?>(.*?)</actor>', dotAll: true)
+      .allMatches(xml)) {
+    final n = _nfoFirst(m.group(1)!, 'name');
+    if (n.isNotEmpty && !actors.contains(n)) actors.add(n);
+  }
+  it.actors = actors;
+}
+
+/// 影视库的数据：影片文件夹、影片列表、收藏和已看记录
+class LibraryStore extends ChangeNotifier {
+  final folders = <String>[];
+  List<LibItem> items = [];
+  final favs = <String>{};
+  final seen = <String>{};
+  bool scanning = false;
+  String scanMsg = '';
+  bool loaded = false;
+
+  String get _indexFile => p.join(_dataDir, 'library.json');
+  String get _stateFile => p.join(_dataDir, 'library_state.json');
+
+  Future<void> load() async {
+    if (loaded) return;
+    loaded = true;
+    try {
+      final f = File(_indexFile);
+      if (f.existsSync()) {
+        final j = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
+        folders
+          ..clear()
+          ..addAll((j['folders'] as List).cast<String>());
+        items = (j['items'] as List)
+            .map((e) => LibItem.fromJson(Map<String, dynamic>.from(e as Map)))
+            .toList();
+      }
+    } catch (_) {}
+    try {
+      final f = File(_stateFile);
+      if (f.existsSync()) {
+        final j = jsonDecode(await f.readAsString()) as Map<String, dynamic>;
+        favs
+          ..clear()
+          ..addAll((j['fav'] as List).cast<String>());
+        seen
+          ..clear()
+          ..addAll((j['seen'] as List).cast<String>());
+      }
+    } catch (_) {}
+    notifyListeners();
+  }
+
+  Future<void> _saveIndex() async {
+    try {
+      final f = File(_indexFile);
+      await f.parent.create(recursive: true);
+      await f.writeAsString(jsonEncode({
+        'folders': folders,
+        'items': items.map((e) => e.toJson()).toList(),
+      }));
+    } catch (_) {}
+  }
+
+  Future<void> _saveState() async {
+    try {
+      final f = File(_stateFile);
+      await f.parent.create(recursive: true);
+      await f.writeAsString(
+          jsonEncode({'fav': favs.toList(), 'seen': seen.toList()}));
+    } catch (_) {}
+  }
+
+  bool isFav(LibItem it) => favs.contains(it.key);
+  bool isSeen(LibItem it) => seen.contains(it.key);
+
+  void toggleFav(LibItem it) {
+    if (!favs.remove(it.key)) favs.add(it.key);
+    _saveState();
+    notifyListeners();
+  }
+
+  void setSeen(LibItem it, bool v) {
+    if (v) {
+      seen.add(it.key);
+    } else {
+      seen.remove(it.key);
+    }
+    _saveState();
+    notifyListeners();
+  }
+
+  /// 添加影片文件夹。已被包含的返回 false；新文件夹包含了旧的，会合并
+  Future<bool> addFolder(String dir) async {
+    final n = p.normalize(dir);
+    if (folders.any((f) => p.equals(f, n) || p.isWithin(f, n))) return false;
+    folders.removeWhere((f) => p.isWithin(n, f));
+    folders.add(n);
+    await _saveIndex();
+    notifyListeners();
+    return true;
+  }
+
+  Future<void> removeFolder(String dir) async {
+    folders.removeWhere((f) => p.equals(f, dir));
+    items.removeWhere((it) => p.isWithin(dir, it.path));
+    await _saveIndex();
+    notifyListeners();
+  }
+
+  /// 重新扫描所有影片文件夹。NFO 没有变化的影片直接沿用上次的结果，所以很快
+  Future<void> rescan() async {
+    if (scanning) return;
+    scanning = true;
+    scanMsg = '正在扫描…';
+    notifyListeners();
+    try {
+      final old = {for (final it in items) it.path: it};
+      final out = <LibItem>[];
+      for (final root in List<String>.of(folders)) {
+        await _scanRoot(root, old, out);
+      }
+      items = out;
+      await _saveIndex();
+    } catch (_) {
+    } finally {
+      scanning = false;
+      scanMsg = '';
+      notifyListeners();
+    }
+  }
+
+  Future<void> _scanRoot(
+      String root, Map<String, LibItem> old, List<LibItem> out) async {
+    final stack = <String>[root];
+    var n = 0;
+    while (stack.isNotEmpty) {
+      final dir = stack.removeLast();
+      List<FileSystemEntity> entries;
+      try {
+        entries = await Directory(dir).list(followLinks: false).toList();
+      } catch (_) {
+        continue;
+      }
+      final names = <String, String>{}; // 小写文件名 → 实际文件名
+      final files = <File>[];
+      for (final e in entries) {
+        final name = p.basename(e.path);
+        names[name.toLowerCase()] = name;
+        if (e is Directory) {
+          if (name.startsWith('@') ||
+              name.startsWith('#') ||
+              name.startsWith('.') ||
+              name.startsWith('\$') ||
+              name == 'System Volume Information' ||
+              name == 'extrafanart' ||
+              name.endsWith('-extrafanart')) {
+            continue;
+          }
+          stack.add(e.path);
+        } else if (e is File &&
+            _videoExts.contains(p.extension(name).toLowerCase())) {
+          files.add(e);
+        }
+      }
+      for (final f in files) {
+        out.add(await _buildItem(f, names, old[f.path]));
+        n++;
+        if (n % 20 == 0) {
+          scanMsg = '已扫描 $n 部…';
+          notifyListeners();
+          await Future<void>.delayed(Duration.zero);
+        }
+      }
+    }
+  }
+
+  Future<LibItem> _buildItem(
+      File f, Map<String, String> names, LibItem? cached) async {
+    final path = f.path;
+    final dir = p.dirname(path);
+    final stem = p.basenameWithoutExtension(path);
+    final it = LibItem(path);
+    try {
+      it.added = (await f.lastModified()).millisecondsSinceEpoch;
+    } catch (_) {}
+
+    final nfoName = names['$stem.nfo'.toLowerCase()];
+    var ok = false;
+    if (nfoName != null) {
+      try {
+        final nfo = File(p.join(dir, nfoName));
+        final st = await nfo.stat();
+        final mt = st.modified.millisecondsSinceEpoch;
+        if (cached != null &&
+            cached.hasNfo &&
+            cached.nfoMtime == mt &&
+            cached.nfoSize == st.size) {
+          it.copyMetaFrom(cached); // NFO 没变，沿用旧结果
+        } else {
+          applyNfo(
+              it, utf8.decode(await nfo.readAsBytes(), allowMalformed: true));
+        }
+        it.hasNfo = true;
+        it.nfoMtime = mt;
+        it.nfoSize = st.size;
+        ok = true;
+      } catch (_) {}
+    }
+    if (!ok) {
+      it.num = extractCode(stem) ?? '';
+      it.title = stem;
+    }
+
+    String pick(List<String> cands) {
+      for (final c in cands) {
+        final real = names[c.toLowerCase()];
+        if (real != null) return p.join(dir, real);
+      }
+      return '';
+    }
+
+    it.poster = pick([
+      '$stem-poster.jpg',
+      '$stem-poster.png',
+      '$stem-poster.jpeg',
+      'poster.jpg',
+      'poster.png',
+      'folder.jpg',
+      'cover.jpg',
+    ]);
+    it.fanart = pick([
+      '$stem-fanart.jpg',
+      '$stem-fanart.png',
+      'fanart.jpg',
+      'backdrop.jpg',
+      '$stem-thumb.jpg',
+    ]);
+    it.hasStills = names.containsKey('extrafanart') ||
+        names.containsKey('$stem-extrafanart'.toLowerCase());
+    return it;
+  }
+
+  /// 修改标题（写回 NFO）。成功返回 null，失败返回原因
+  Future<String?> editTitle(LibItem it, String newTitle) async {
+    if (!it.hasNfo) return '这部影片还没有 NFO，请先刮削';
+    try {
+      final nfo = File(p.join(it.dir, '${it.stem}.nfo'));
+      final xml = utf8.decode(await nfo.readAsBytes(), allowMalformed: true);
+      final raw = _nfoFirst(xml, 'title');
+      final hadNum = it.num.isNotEmpty &&
+          raw.toUpperCase().startsWith(it.num.toUpperCase());
+      final newRaw = hadNum ? '${it.num} $newTitle' : newTitle;
+      final re = RegExp(r'<title(?:\s[^>]*)?>.*?</title>', dotAll: true);
+      if (!re.hasMatch(xml)) return 'NFO 里没有找到标题标签';
+      final out = xml.replaceFirstMapped(re, (_) => '<title>${_x(newRaw)}</title>');
+      await nfo.writeAsString(out);
+      final st = await nfo.stat();
+      it.title = newTitle;
+      it.nfoMtime = st.modified.millisecondsSinceEpoch;
+      it.nfoSize = st.size;
+      await _saveIndex();
+      notifyListeners();
+      return null;
+    } catch (e) {
+      return errText(e);
+    }
+  }
+}
+
+final libStore = LibraryStore();
+
+// ═══════════════════════ 影视库：界面 ═══════════════════════
+
+Future<String?> pickOption(
+    BuildContext context, String title, Map<String, int> options) {
+  return showDialog<String>(
+    context: context,
+    builder: (ctx) => _PickDialog(title: title, options: options),
+  );
+}
+
+class _PickDialog extends StatefulWidget {
+  final String title;
+  final Map<String, int> options;
+  const _PickDialog({required this.title, required this.options});
+
+  @override
+  State<_PickDialog> createState() => _PickDialogState();
+}
+
+class _PickDialogState extends State<_PickDialog> {
+  String q = '';
+
+  @override
+  Widget build(BuildContext context) {
+    final all = widget.options.entries.toList()
+      ..sort((a, b) {
+        final c = b.value.compareTo(a.value);
+        return c != 0 ? c : a.key.compareTo(b.key);
+      });
+    final shown = q.isEmpty
+        ? all
+        : all.where((e) => e.key.toLowerCase().contains(q.toLowerCase())).toList();
+    return AlertDialog(
+      title: Text('选择${widget.title}'),
+      content: SizedBox(
+        width: 360,
+        height: 420,
+        child: Column(
+          children: [
+            TextField(
+              autofocus: true,
+              decoration: const InputDecoration(
+                hintText: '搜索',
+                prefixIcon: Icon(Icons.search),
+                isDense: true,
+                border: OutlineInputBorder(),
+              ),
+              onChanged: (v) => setState(() => q = v.trim()),
+            ),
+            const SizedBox(height: 8),
+            Expanded(
+              child: shown.isEmpty
+                  ? const Center(child: Text('没有匹配的项目'))
+                  : ListView.builder(
+                      itemCount: shown.length,
+                      itemBuilder: (_, i) => ListTile(
+                        dense: true,
+                        title: Text(shown[i].key),
+                        trailing: Text('${shown[i].value} 部'),
+                        onTap: () => Navigator.pop(context, shown[i].key),
+                      ),
+                    ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(context), child: const Text('取消')),
+      ],
+    );
+  }
+}
+
+/// 演员 / 厂商 / 类别 排行，点击可筛选
+class StatsPage extends StatelessWidget {
+  final Map<String, int> actors;
+  final Map<String, int> studios;
+  final Map<String, int> genres;
+  const StatsPage({
+    super.key,
+    required this.actors,
+    required this.studios,
+    required this.genres,
+  });
+
+  Widget _rank(BuildContext context, String kind, Map<String, int> m) {
+    final e = m.entries.toList()
+      ..sort((a, b) {
+        final c = b.value.compareTo(a.value);
+        return c != 0 ? c : a.key.compareTo(b.key);
+      });
+    if (e.isEmpty) return const Center(child: Text('暂无数据'));
+    return ListView.builder(
+      itemCount: e.length,
+      itemBuilder: (_, i) => ListTile(
+        dense: true,
+        leading: Text('${i + 1}'),
+        title: Text(e[i].key),
+        trailing: Text('${e[i].value} 部'),
+        onTap: () => Navigator.pop(context, (kind, e[i].key)),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return DefaultTabController(
+      length: 3,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('统计（点击可筛选）'),
+          bottom: const TabBar(
+            tabs: [Tab(text: '演员'), Tab(text: '厂商'), Tab(text: '类别')],
+          ),
+        ),
+        body: TabBarView(
+          children: [
+            _rank(context, 'actor', actors),
+            _rank(context, 'studio', studios),
+            _rank(context, 'genre', genres),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+Future<void> _openFile(String path) async {
+  if (Platform.isWindows) {
+    await Process.run('rundll32', ['url.dll,FileProtocolHandler', path]);
+  } else if (Platform.isMacOS) {
+    await Process.run('open', [path]);
+  } else {
+    await Process.run('xdg-open', [path]);
+  }
+}
+
+Future<void> _showInFolder(String path) async {
+  if (Platform.isWindows) {
+    await Process.run('explorer.exe', ['/select,', path]);
+  } else if (Platform.isMacOS) {
+    await Process.run('open', ['-R', path]);
+  } else {
+    await Process.run('xdg-open', [p.dirname(path)]);
+  }
+}
+
+Widget _posterImage(String path, {BoxFit fit = BoxFit.cover, int? cacheWidth}) {
+  return Image.file(
+    File(path),
+    fit: fit,
+    cacheWidth: cacheWidth,
+    errorBuilder: (_, __, ___) => Container(
+      color: Colors.black12,
+      child: const Center(child: Icon(Icons.broken_image)),
+    ),
+  );
+}
+
+class LibraryPage extends StatefulWidget {
+  /// 对一批影片重新刮削（由刮削页面执行）
+  final Future<void> Function(List<LibItem> items) onRescrape;
+  const LibraryPage({super.key, required this.onRescrape});
+
+  @override
+  State<LibraryPage> createState() => _LibraryPageState();
+}
+
+class _LibraryPageState extends State<LibraryPage> {
+  final _searchCtl = TextEditingController();
+  String _q = '';
+  String _sort = 'added';
+  bool _grid = true;
+  String _quick = 'all'; // all fav unseen unscraped incomplete dup
+  String? _actor, _genre, _studio, _series, _year;
+
+  @override
+  void initState() {
+    super.initState();
+    libStore.addListener(_onStore);
+    libStore.load().then((_) {
+      if (libStore.folders.isNotEmpty) libStore.rescan();
+    });
+  }
+
+  @override
+  void dispose() {
+    libStore.removeListener(_onStore);
+    _searchCtl.dispose();
+    super.dispose();
+  }
+
+  void _onStore() {
+    if (mounted) setState(() {});
+  }
+
+  bool get _hasFilter =>
+      _actor != null ||
+      _genre != null ||
+      _studio != null ||
+      _series != null ||
+      _year != null ||
+      _quick != 'all';
+
+  void _clearFilters() {
+    _actor = _genre = _studio = _series = _year = null;
+    _quick = 'all';
+    _q = '';
+    _searchCtl.clear();
+  }
+
+  Map<String, int> _count(List<String> Function(LibItem) f) {
+    final m = <String, int>{};
+    for (final it in libStore.items) {
+      for (final k in f(it)) {
+        if (k.isEmpty) continue;
+        m[k] = (m[k] ?? 0) + 1;
+      }
+    }
+    return m;
+  }
+
+  List<LibItem> _filtered() {
+    final q = _q.trim().toLowerCase();
+    final dupKeys = <String>{};
+    if (_quick == 'dup') {
+      final cnt = <String, int>{};
+      for (final it in libStore.items) {
+        if (it.num.isNotEmpty) cnt[it.num] = (cnt[it.num] ?? 0) + 1;
+      }
+      cnt.forEach((k, v) {
+        if (v > 1) dupKeys.add(k);
+      });
+    }
+    final list = libStore.items.where((it) {
+      if (_actor != null && !it.actors.contains(_actor)) return false;
+      if (_genre != null && !it.genres.contains(_genre)) return false;
+      if (_studio != null && it.studio != _studio) return false;
+      if (_series != null && it.series != _series) return false;
+      if (_year != null && it.year != _year) return false;
+      switch (_quick) {
+        case 'fav':
+          if (!libStore.isFav(it)) return false;
+          break;
+        case 'unseen':
+          if (libStore.isSeen(it)) return false;
+          break;
+        case 'unscraped':
+          if (it.hasNfo) return false;
+          break;
+        case 'incomplete':
+          if (!it.incomplete) return false;
+          break;
+        case 'dup':
+          if (!dupKeys.contains(it.num)) return false;
+          break;
+      }
+      if (q.isNotEmpty) {
+        final hay =
+            '${it.num} ${it.title} ${it.origTitle} ${it.actors.join(' ')} ${it.studio} ${it.series}'
+                .toLowerCase();
+        if (!hay.contains(q)) return false;
+      }
+      return true;
+    }).toList();
+    switch (_sort) {
+      case 'date':
+        list.sort((a, b) => b.date.compareTo(a.date));
+        break;
+      case 'num':
+        list.sort((a, b) => a.num.compareTo(b.num));
+        break;
+      case 'title':
+        list.sort((a, b) => a.title.compareTo(b.title));
+        break;
+      default:
+        list.sort((a, b) => b.added.compareTo(a.added));
+    }
+    return list;
+  }
+
+  Future<void> _open(LibItem it) async {
+    final r = await Navigator.push<(String, String)>(
+      context,
+      MaterialPageRoute(builder: (_) => LibraryDetailPage(item: it)),
+    );
+    if (r == null || !mounted) return;
+    if (r.$1 == 'rescrape') {
+      await widget.onRescrape([it]);
+      return;
+    }
+    _applyPick(r.$1, r.$2);
+  }
+
+  void _applyPick(String kind, String value) {
+    setState(() {
+      _clearFilters();
+      switch (kind) {
+        case 'actor':
+          _actor = value;
+          break;
+        case 'genre':
+          _genre = value;
+          break;
+        case 'studio':
+          _studio = value;
+          break;
+        case 'series':
+          _series = value;
+          break;
+      }
+    });
+  }
+
+  Future<void> _openStats() async {
+    final r = await Navigator.push<(String, String)>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => StatsPage(
+          actors: _count((e) => e.actors),
+          studios: _count((e) => [e.studio]),
+          genres: _count((e) => e.genres),
+        ),
+      ),
+    );
+    if (r != null && mounted) _applyPick(r.$1, r.$2);
+  }
+
+  Future<void> _openFilter() async {
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setM) {
+          Widget row(String label, String? value, Map<String, int> options,
+              void Function(String?) set) {
+            return ListTile(
+              title: Text(label),
+              subtitle: Text(value ?? '不限'),
+              trailing: value == null
+                  ? const Icon(Icons.chevron_right)
+                  : IconButton(
+                      icon: const Icon(Icons.clear),
+                      onPressed: () {
+                        set(null);
+                        setM(() {});
+                        setState(() {});
+                      },
+                    ),
+              onTap: () async {
+                final v = await pickOption(ctx, label, options);
+                if (v != null) {
+                  set(v);
+                  setM(() {});
+                  setState(() {});
+                }
+              },
+            );
+          }
+
+          return SafeArea(
+            child: ListView(
+              shrinkWrap: true,
+              children: [
+                row('演员', _actor, _count((e) => e.actors), (v) => _actor = v),
+                row('类别', _genre, _count((e) => e.genres), (v) => _genre = v),
+                row('厂商', _studio, _count((e) => [e.studio]),
+                    (v) => _studio = v),
+                row('系列', _series, _count((e) => [e.series]),
+                    (v) => _series = v),
+                row('年份', _year, _count((e) => [e.year]), (v) => _year = v),
+                Padding(
+                  padding: const EdgeInsets.all(8),
+                  child: TextButton(
+                    onPressed: () {
+                      setState(_clearFilters);
+                      Navigator.pop(ctx);
+                    },
+                    child: const Text('清除全部筛选'),
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Future<void> _manageFolders() async {
+    await showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setM) => AlertDialog(
+          title: const Text('影片文件夹'),
+          content: SizedBox(
+            width: 480,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (libStore.folders.isEmpty)
+                    const Padding(
+                      padding: EdgeInsets.all(8),
+                      child: Text('还没有添加文件夹'),
+                    ),
+                  for (final f in libStore.folders)
+                    ListTile(
+                      dense: true,
+                      title: Text(f),
+                      trailing: IconButton(
+                        icon: const Icon(Icons.delete_outline),
+                        tooltip: '从影视库移除（不会删除任何文件）',
+                        onPressed: () async {
+                          await libStore.removeFolder(f);
+                          setM(() {});
+                        },
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () async {
+                final d = await FilePicker.platform
+                    .getDirectoryPath(dialogTitle: '选择影片文件夹');
+                if (d != null) {
+                  final added = await libStore.addFolder(d);
+                  setM(() {});
+                  if (added) libStore.rescan();
+                }
+              },
+              child: const Text('添加文件夹'),
+            ),
+            FilledButton(
+                onPressed: () => Navigator.pop(ctx), child: const Text('完成')),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _fix(List<LibItem> list) async {
+    final yes = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('补刮？'),
+        content: Text('将对 ${list.length} 部未刮削或缺封面的影片重新刮削，'
+            '会覆盖已有的 NFO 和封面，需要一些时间。\n\n'
+            '过程和结果会显示在「刮削」页面里。'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('取消')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('开始补刮')),
+        ],
+      ),
+    );
+    if (yes == true) await widget.onRescrape(list);
+  }
+
+  Widget _badges(LibItem it) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (libStore.isFav(it))
+          const Icon(Icons.favorite, color: Colors.redAccent, size: 20),
+        if (libStore.isSeen(it))
+          const Icon(Icons.check_circle, color: Colors.green, size: 20),
+      ],
+    );
+  }
+
+  Widget _card(LibItem it) {
+    final img = it.poster.isNotEmpty ? it.poster : it.fanart;
+    return InkWell(
+      onTap: () => _open(it),
+      child: Card(
+        clipBehavior: Clip.antiAlias,
+        margin: const EdgeInsets.all(4),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              child: Stack(
+                fit: StackFit.expand,
+                children: [
+                  img.isEmpty
+                      ? Container(
+                          color: Colors.black12,
+                          child: const Icon(Icons.movie, size: 48),
+                        )
+                      : _posterImage(img, cacheWidth: 380),
+                  Positioned(top: 4, right: 4, child: _badges(it)),
+                  if (!it.hasNfo)
+                    Positioned(
+                      left: 4,
+                      top: 4,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 6, vertical: 2),
+                        color: Colors.orange,
+                        child: const Text('未刮削',
+                            style:
+                                TextStyle(color: Colors.white, fontSize: 11)),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(8, 6, 8, 8),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(it.num.isEmpty ? '（无番号）' : it.num,
+                      style: const TextStyle(fontWeight: FontWeight.bold),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis),
+                  Text(it.title,
+                      style: const TextStyle(fontSize: 12),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _tile(LibItem it) {
+    final img = it.poster.isNotEmpty ? it.poster : it.fanart;
+    return ListTile(
+      leading: SizedBox(
+        width: 44,
+        height: 64,
+        child: img.isEmpty
+            ? const Icon(Icons.movie)
+            : _posterImage(img, cacheWidth: 120),
+      ),
+      title: Text('${it.num.isEmpty ? '' : '${it.num}  '}${it.title}',
+          maxLines: 1, overflow: TextOverflow.ellipsis),
+      subtitle: Text(
+        [
+          if (it.actors.isNotEmpty) it.actors.take(3).join('、'),
+          if (it.studio.isNotEmpty) it.studio,
+          if (it.date.isNotEmpty) it.date,
+          if (!it.hasNfo) '未刮削',
+        ].join('  ·  '),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+      ),
+      trailing: _badges(it),
+      onTap: () => _open(it),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final list = _filtered();
+    final fixable = list.where((e) => !e.hasNfo || e.incomplete).toList();
+    const quicks = [
+      ['all', '全部'],
+      ['fav', '收藏'],
+      ['unseen', '未看'],
+      ['unscraped', '未刮削'],
+      ['incomplete', '缺封面'],
+      ['dup', '重复番号'],
+    ];
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('影视库　${list.length} / ${libStore.items.length}'),
+        actions: [
+          IconButton(
+            tooltip: _grid ? '切换为列表' : '切换为封面墙',
+            icon: Icon(_grid ? Icons.view_list : Icons.grid_view),
+            onPressed: () => setState(() => _grid = !_grid),
+          ),
+          IconButton(
+            tooltip: '筛选',
+            icon: Icon(Icons.filter_alt,
+                color: _hasFilter ? Colors.orange : null),
+            onPressed: _openFilter,
+          ),
+          IconButton(
+            tooltip: '统计',
+            icon: const Icon(Icons.bar_chart),
+            onPressed: libStore.items.isEmpty ? null : _openStats,
+          ),
+          IconButton(
+            tooltip: '重新扫描',
+            icon: const Icon(Icons.refresh),
+            onPressed: libStore.scanning ? null : () => libStore.rescan(),
+          ),
+          IconButton(
+            tooltip: '管理影片文件夹',
+            icon: const Icon(Icons.folder_special),
+            onPressed: _manageFolders,
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _searchCtl,
+                    decoration: const InputDecoration(
+                      hintText: '搜索番号、标题、演员、厂商、系列',
+                      prefixIcon: Icon(Icons.search),
+                      isDense: true,
+                      border: OutlineInputBorder(),
+                    ),
+                    onChanged: (v) => setState(() => _q = v),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                DropdownButton<String>(
+                  value: _sort,
+                  underline: const SizedBox(),
+                  items: const [
+                    DropdownMenuItem(value: 'added', child: Text('按添加时间')),
+                    DropdownMenuItem(value: 'date', child: Text('按发行日期')),
+                    DropdownMenuItem(value: 'num', child: Text('按番号')),
+                    DropdownMenuItem(value: 'title', child: Text('按标题')),
+                  ],
+                  onChanged: (v) => setState(() => _sort = v ?? 'added'),
+                ),
+              ],
+            ),
+          ),
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+            child: Row(
+              children: [
+                for (final q in quicks)
+                  Padding(
+                    padding: const EdgeInsets.only(right: 8),
+                    child: ChoiceChip(
+                      label: Text(q[1]),
+                      selected: _quick == q[0],
+                      onSelected: (_) => setState(() => _quick = q[0]),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          if (_actor != null ||
+              _genre != null ||
+              _studio != null ||
+              _series != null ||
+              _year != null)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Wrap(
+                  spacing: 8,
+                  children: [
+                    if (_actor != null)
+                      InputChip(
+                          label: Text('演员：$_actor'),
+                          onDeleted: () => setState(() => _actor = null)),
+                    if (_genre != null)
+                      InputChip(
+                          label: Text('类别：$_genre'),
+                          onDeleted: () => setState(() => _genre = null)),
+                    if (_studio != null)
+                      InputChip(
+                          label: Text('厂商：$_studio'),
+                          onDeleted: () => setState(() => _studio = null)),
+                    if (_series != null)
+                      InputChip(
+                          label: Text('系列：$_series'),
+                          onDeleted: () => setState(() => _series = null)),
+                    if (_year != null)
+                      InputChip(
+                          label: Text('年份：$_year'),
+                          onDeleted: () => setState(() => _year = null)),
+                  ],
+                ),
+              ),
+            ),
+          if (libStore.scanning)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(12, 4, 12, 0),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const LinearProgressIndicator(),
+                  Text(libStore.scanMsg, style: const TextStyle(fontSize: 12)),
+                ],
+              ),
+            ),
+          if (fixable.isNotEmpty)
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Padding(
+                padding: const EdgeInsets.only(left: 8),
+                child: TextButton.icon(
+                  onPressed: () => _fix(fixable),
+                  icon: const Icon(Icons.auto_fix_high),
+                  label: Text('补刮当前列表中的 ${fixable.length} 部（未刮削 / 缺封面）'),
+                ),
+              ),
+            ),
+          Expanded(
+            child: libStore.folders.isEmpty
+                ? Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Text('影视库还是空的，先添加存放影片的文件夹'),
+                        const SizedBox(height: 12),
+                        FilledButton.icon(
+                          onPressed: _manageFolders,
+                          icon: const Icon(Icons.create_new_folder),
+                          label: const Text('添加影片文件夹'),
+                        ),
+                      ],
+                    ),
+                  )
+                : list.isEmpty
+                    ? Center(
+                        child: Text(libStore.scanning ? '正在扫描…' : '没有符合条件的影片'))
+                    : (_grid
+                        ? GridView.builder(
+                            padding: const EdgeInsets.all(8),
+                            gridDelegate:
+                                const SliverGridDelegateWithMaxCrossAxisExtent(
+                              maxCrossAxisExtent: 190,
+                              mainAxisExtent: 330,
+                            ),
+                            itemCount: list.length,
+                            itemBuilder: (_, i) => _card(list[i]),
+                          )
+                        : ListView.builder(
+                            itemCount: list.length,
+                            itemBuilder: (_, i) => _tile(list[i]),
+                          )),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class LibraryDetailPage extends StatefulWidget {
+  final LibItem item;
+  const LibraryDetailPage({super.key, required this.item});
+
+  @override
+  State<LibraryDetailPage> createState() => _LibraryDetailPageState();
+}
+
+class _LibraryDetailPageState extends State<LibraryDetailPage> {
+  List<String> _stills = [];
+
+  @override
+  void initState() {
+    super.initState();
+    libStore.addListener(_onStore);
+    _loadStills();
+  }
+
+  @override
+  void dispose() {
+    libStore.removeListener(_onStore);
+    super.dispose();
+  }
+
+  void _onStore() {
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _loadStills() async {
+    final it = widget.item;
+    final out = <String>[];
+    for (final d in [
+      p.join(it.dir, 'extrafanart'),
+      p.join(it.dir, '${it.stem}-extrafanart'),
+    ]) {
+      try {
+        final dir = Directory(d);
+        if (!await dir.exists()) continue;
+        final files = <String>[];
+        await for (final e in dir.list()) {
+          if (e is File && _imgExts.contains(p.extension(e.path).toLowerCase())) {
+            files.add(e.path);
+          }
+        }
+        files.sort();
+        out.addAll(files);
+      } catch (_) {}
+    }
+    if (mounted) setState(() => _stills = out);
+  }
+
+  void _snack(String t) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(t)));
+  }
+
+  Future<void> _play() async {
+    final it = widget.item;
+    try {
+      await _openFile(it.path);
+      libStore.setSeen(it, true);
+    } catch (e) {
+      _snack('无法打开：${errText(e)}');
+    }
+  }
+
+  Future<void> _showFolder() async {
+    try {
+      await _showInFolder(widget.item.path);
+    } catch (e) {
+      _snack('无法打开：${errText(e)}');
+    }
+  }
+
+  Future<void> _editTitle() async {
+    final it = widget.item;
+    final c = TextEditingController(text: it.title);
+    final v = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('修改标题'),
+        content: SizedBox(
+          width: 420,
+          child: TextField(
+            controller: c,
+            autofocus: true,
+            maxLines: null,
+            decoration: const InputDecoration(border: OutlineInputBorder()),
+          ),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+          FilledButton(
+              onPressed: () => Navigator.pop(ctx, c.text),
+              child: const Text('保存')),
+        ],
+      ),
+    );
+    if (v == null || v.trim().isEmpty || v.trim() == it.title) return;
+    final err = await libStore.editTitle(it, v.trim());
+    _snack(err ?? '标题已修改，并写回了 NFO');
+  }
+
+  Widget _info(String label, String value) {
+    if (value.isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+              width: 72,
+              child: Text(label, style: const TextStyle(color: Colors.grey))),
+          Expanded(child: SelectableText(value)),
+        ],
+      ),
+    );
+  }
+
+  Widget _chips(String label, List<String> values, String kind) {
+    if (values.isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(top: 10),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(label, style: const TextStyle(color: Colors.grey)),
+          const SizedBox(height: 4),
+          Wrap(
+            spacing: 8,
+            runSpacing: 4,
+            children: [
+              for (final v in values)
+                ActionChip(
+                  label: Text(v),
+                  onPressed: () => Navigator.pop(context, (kind, v)),
+                ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final it = widget.item;
+    final big = it.fanart.isNotEmpty ? it.fanart : it.poster;
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(it.num.isEmpty ? it.title : it.num),
+        actions: [
+          IconButton(
+            tooltip: libStore.isFav(it) ? '取消收藏' : '收藏',
+            icon: Icon(
+              libStore.isFav(it) ? Icons.favorite : Icons.favorite_border,
+              color: libStore.isFav(it) ? Colors.redAccent : null,
+            ),
+            onPressed: () => libStore.toggleFav(it),
+          ),
+          IconButton(
+            tooltip: libStore.isSeen(it) ? '标为未看' : '标为已看',
+            icon: Icon(
+              libStore.isSeen(it)
+                  ? Icons.check_circle
+                  : Icons.check_circle_outline,
+              color: libStore.isSeen(it) ? Colors.green : null,
+            ),
+            onPressed: () => libStore.setSeen(it, !libStore.isSeen(it)),
+          ),
+        ],
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          if (big.isNotEmpty)
+            SizedBox(
+              height: 340,
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: _posterImage(big, fit: BoxFit.contain),
+              ),
+            ),
+          const SizedBox(height: 12),
+          SelectableText(it.title,
+              style: Theme.of(context).textTheme.titleLarge),
+          if (it.origTitle.isNotEmpty && it.origTitle != it.title)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: SelectableText(it.origTitle,
+                  style: const TextStyle(color: Colors.grey)),
+            ),
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              FilledButton.icon(
+                onPressed: _play,
+                icon: const Icon(Icons.play_arrow),
+                label: const Text('播放'),
+              ),
+              OutlinedButton.icon(
+                onPressed: _showFolder,
+                icon: const Icon(Icons.folder_open),
+                label: const Text('打开所在文件夹'),
+              ),
+              OutlinedButton.icon(
+                onPressed: () => Navigator.pop(context, ('rescrape', '')),
+                icon: const Icon(Icons.refresh),
+                label: const Text('重新刮削'),
+              ),
+              OutlinedButton.icon(
+                onPressed: _editTitle,
+                icon: const Icon(Icons.edit),
+                label: const Text('修改标题'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          _info('番号', it.num),
+          _info('发行日期', it.date),
+          _info('时长', it.runtime > 0 ? '${it.runtime} 分钟' : ''),
+          _info('导演', it.director),
+          _chips('演员', it.actors, 'actor'),
+          _chips('类别', it.genres, 'genre'),
+          _chips('厂商', it.studio.isEmpty ? [] : [it.studio], 'studio'),
+          _chips('系列', it.series.isEmpty ? [] : [it.series], 'series'),
+          if (it.tags.isNotEmpty) _info('标签', it.tags.join('、')),
+          const SizedBox(height: 10),
+          _info('文件', it.path),
+          if (_stills.isNotEmpty) ...[
+            const SizedBox(height: 14),
+            Text('剧照（${_stills.length}）',
+                style: const TextStyle(color: Colors.grey)),
+            const SizedBox(height: 6),
+            SizedBox(
+              height: 150,
+              child: ListView.builder(
+                scrollDirection: Axis.horizontal,
+                itemCount: _stills.length,
+                itemBuilder: (_, i) => Padding(
+                  padding: const EdgeInsets.only(right: 8),
+                  child: GestureDetector(
+                    onTap: () => showDialog(
+                      context: context,
+                      builder: (_) => Dialog(
+                        child: InteractiveViewer(
+                          child: _posterImage(_stills[i], fit: BoxFit.contain),
+                        ),
+                      ),
+                    ),
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(6),
+                      child: _posterImage(_stills[i], cacheWidth: 400),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
 // ═══════════════════════ NFO ═══════════════════════
 
 String _x(String s) => s
@@ -1455,6 +2923,9 @@ class _HomePageState extends State<HomePage> {
   int _undoCount = 0;
   final _cache = <String, Movie>{};
   final _coverCache = <String, Uint8List>{};
+  int _tab = 0; // 电脑版：0=刮削 1=影视库
+  String? _rootOverride; // 影视库补刮时，整理的根文件夹
+  bool _recOn = true; // 是否记录生成的文件（影视库补刮时不记录）
   String? _selDir; // 已选择的影片文件夹
   String _selKind = 'local';
   List<String> _files = []; // 已选文件夹里的视频
@@ -1589,6 +3060,7 @@ class _HomePageState extends State<HomePage> {
 
   /// 记录本次生成的文件（撤销时会删除）
   void _rec(String path) {
+    if (!_recOn) return;
     final c = _batch?['created'];
     if (c is List) c.add(path);
   }
@@ -1622,8 +3094,10 @@ class _HomePageState extends State<HomePage> {
   /// 计算整理后的目标文件夹
   String _destDir(List<String> parts, String vpath) {
     final cur = p.dirname(vpath);
-    if (s.organizeBase == 'root' && _selDir != null && _selKind == _failKind) {
-      return p.joinAll([_selDir!, ...parts]);
+    final root = _rootOverride ??
+        ((_selDir != null && _selKind == _failKind) ? _selDir : null);
+    if (s.organizeBase == 'root' && root != null) {
+      return p.joinAll([root, ...parts]);
     }
     if (_tailMatches(cur, parts)) return cur; // 已经在对应文件夹里，不再套一层
     return p.joinAll([cur, ...parts]);
@@ -1714,14 +3188,80 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  /// 影视库里的「补刮 / 重新刮削」：对选中的影片重新刮削（覆盖已有 NFO 和封面）
+  Future<void> _rescrapeLibrary(List<LibItem> list) async {
+    if (_running || _scanning || list.isEmpty) return;
+    _syncCfg();
+    setState(() {
+      _tab = 0; // 切到刮削页面，方便看进度
+      _running = true;
+      _cancel = false;
+      _done = 0;
+      _total = list.length;
+      _logs.clear();
+      _failed.clear();
+    });
+    _log('影片刮削器 v$appVersion');
+    _log('📚 从影视库重新刮削 ${list.length} 部影片（会覆盖已有 NFO 和封面）');
+
+    final fsys = LocalFs();
+    _failKind = 'local';
+    _cache.clear();
+    _coverCache.clear();
+    _batch = _newBatch(
+        '影视库补刮 ${DateTime.now().toString().substring(0, 16)}', 'local');
+    _recOn = false; // 覆盖了原有文件，撤销时不要删除它们
+    final net = Net(s.proxy);
+    var ok = 0, fail = 0;
+    try {
+      for (final it in list) {
+        if (_cancel) {
+          _log('⏹ 已停止');
+          break;
+        }
+        _rootOverride = libStore.folders.firstWhere(
+            (f) => p.equals(f, it.dir) || p.isWithin(f, it.path),
+            orElse: () => it.dir);
+        var code = 2;
+        _failReason = '';
+        try {
+          code = await _processOne(net, fsys, it.path,
+              forceNum: it.num.isNotEmpty ? it.num : null, overwrite: true);
+        } catch (e) {
+          _failReason = errText(e);
+          _log('❌ 出错：$_failReason');
+        }
+        if (code == 0) {
+          ok++;
+        } else {
+          fail++;
+          _failed.add(_Fail(it.path, _failReason.isEmpty ? '失败' : _failReason));
+        }
+        if (_batch != null && code == 0) await _commitBatch();
+        if (mounted) setState(() => _done++);
+        await Future.delayed(const Duration(milliseconds: 1500));
+      }
+    } finally {
+      net.close();
+      _rootOverride = null;
+      _recOn = true;
+    }
+    await _commitBatch();
+    _batch = null;
+    _log('🎉 完成：成功 $ok，失败 $fail'
+        '${_failed.isNotEmpty ? '（可点下方按钮手动输入番号重试）' : ''}');
+    if (mounted) setState(() => _running = false);
+    libStore.rescan();
+  }
+
   /// 返回 0=成功 1=跳过 2=失败
   Future<int> _processOne(Net net, Fs fs, String vpath,
-      {String? forceNum, bool dry = false}) async {
+      {String? forceNum, bool dry = false, bool overwrite = false}) async {
     final name = p.basename(vpath);
     final stem = p.basenameWithoutExtension(vpath);
     var base = p.withoutExtension(vpath);
 
-    if (s.skipExisting && await fs.exists('$base.nfo')) {
+    if (s.skipExisting && !overwrite && await fs.exists('$base.nfo')) {
       _log('⏭ 已有 NFO，跳过：$name');
       return 1;
     }
@@ -2097,6 +3637,17 @@ class _HomePageState extends State<HomePage> {
     }
     await fsys.close();
 
+    if (!Platform.isAndroid &&
+        s.autoLibrary &&
+        !dry &&
+        !subsOnly &&
+        kind == 'local' &&
+        ok > 0) {
+      final added = await libStore.addFolder(root);
+      libStore.rescan();
+      if (added) _log('📚 已把这个文件夹加入影视库');
+    }
+
     _log('${dry ? '📋 试运行结束' : '🎉 完成'}：'
         '成功 $ok，跳过 $skip，失败/未识别 $fail'
         '${_failed.isNotEmpty ? '（可点下方按钮手动输入番号重试）' : ''}');
@@ -2215,7 +3766,7 @@ class _HomePageState extends State<HomePage> {
     var code = 2;
     try {
       fs = await _openFs(_failKind);
-      code = await _processOne(net, fs, f.path, forceNum: num);
+      code = await _processOne(net, fs, f.path, forceNum: num, overwrite: true);
       if (code == 0 && _selDir != null && _selKind == _failKind) {
         try {
           final fresh = await scanVideos(fs, _selDir!);
@@ -2461,6 +4012,14 @@ class _HomePageState extends State<HomePage> {
                   value: s.skipExisting,
                   onChanged: (v) => setM(() => s.skipExisting = v),
                 ),
+                if (!Platform.isAndroid)
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('刮削后自动加入影视库'),
+                  subtitle: const Text('刮削成功后，把这个文件夹加入影视库并刷新'),
+                  value: s.autoLibrary,
+                  onChanged: (v) => setM(() => s.autoLibrary = v),
+                ),
                 if (Platform.isAndroid)
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
@@ -2540,6 +4099,41 @@ class _HomePageState extends State<HomePage> {
 
   @override
   Widget build(BuildContext context) {
+    if (Platform.isAndroid) return _buildScrape(context);
+    return Scaffold(
+      body: Row(
+        children: [
+          NavigationRail(
+            selectedIndex: _tab,
+            onDestinationSelected: (i) => setState(() => _tab = i),
+            labelType: NavigationRailLabelType.all,
+            destinations: const [
+              NavigationRailDestination(
+                icon: Icon(Icons.auto_fix_high),
+                label: Text('刮削'),
+              ),
+              NavigationRailDestination(
+                icon: Icon(Icons.video_library),
+                label: Text('影视库'),
+              ),
+            ],
+          ),
+          const VerticalDivider(width: 1),
+          Expanded(
+            child: IndexedStack(
+              index: _tab,
+              children: [
+                _buildScrape(context),
+                LibraryPage(onRescrape: _rescrapeLibrary),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildScrape(BuildContext context) {
     final busy = _running || _scanning;
     final canRun = !busy && _selDir != null && _files.isNotEmpty;
     return Scaffold(
